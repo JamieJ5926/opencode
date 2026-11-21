@@ -345,7 +345,7 @@ describe("Tool", () => {
     Effect.gen(function* () {
       const service = yield* Tool.Service
       yield* transform(service, { echo_tool: constant("base") }, { codemode: false })
-      let source = [{ ...constant("overlay"), name: "echo.tool", options: { codemode: false } }]
+      let source = [{ ...constant("overlay"), name: "echo_tool", options: { codemode: false } }]
       const registration = yield* service.transform((editor) => source.forEach((tool) => editor.add(tool)))
       expect((yield* executeTool(service, call("echo_tool"))).output).toEqual({ text: "overlay" })
 
@@ -384,7 +384,7 @@ describe("Tool", () => {
     }).pipe(Effect.provide(Logger.layer([logger])))
   })
 
-  it.effect("skips invalid and reserved names while letting the last normalized name win", () =>
+  it.effect("skips invalid and reserved names and keeps the first tool when normalized names collide", () =>
     Effect.gen(function* () {
       const service = yield* Tool.Service
       yield* transform(
@@ -403,8 +403,58 @@ describe("Tool", () => {
       expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["after", "before", "echo_tool", "execute"])
       expect((yield* snapshot.execute(call("before"))).output).toEqual({ text: "before" })
       expect((yield* snapshot.execute(call("after"))).output).toEqual({ text: "after" })
-      expect((yield* snapshot.execute(call("echo_tool"))).output).toEqual({ text: "last" })
+      expect((yield* snapshot.execute(call("echo_tool"))).output).toEqual({ text: "first" })
       expect(snapshot.codeModeCatalog?.tools).toEqual([])
+    }),
+  )
+
+  it.effect("records a collision when two tools differ only in characters normalized to _", () => {
+    const output: unknown[] = []
+    const logger = Logger.map(Logger.formatStructured, (entry) => {
+      output.push(entry.message)
+    })
+    return Effect.gen(function* () {
+      const service = yield* Tool.Service
+      yield* service.transform((editor) => {
+        editor.add({ ...constant("dotted deploy"), name: "deploy.staging", options: { codemode: false } })
+        editor.add({ ...constant("underscore deploy"), name: "deploy_staging", options: { codemode: false } })
+        editor.add({ ...constant("namespaced c"), name: "c", options: { namespace: "a.b", codemode: false } })
+        editor.add({ ...constant("namespaced b_c"), name: "b_c", options: { namespace: "a", codemode: false } })
+      })
+
+      expect(output).toEqual([
+        [
+          "Skipping invalid tool registration",
+          {
+            name: "deploy_staging",
+            namespace: undefined,
+            error: 'Tool name collision: "deploy.staging" and "deploy_staging" both normalize to "deploy_staging"',
+          },
+        ],
+        [
+          "Skipping invalid tool registration",
+          {
+            name: "b_c",
+            namespace: "a",
+            error: 'Tool name collision: "c" (namespace "a.b") and "b_c" (namespace "a") both normalize to "a_b_c"',
+          },
+        ],
+      ])
+      const snapshot = yield* service.snapshot()
+      expect(snapshot.definitions.map((tool) => tool.name)).toEqual(["a_b_c", "deploy_staging", "execute"])
+      expect((yield* snapshot.execute(call("deploy_staging"))).output).toEqual({ text: "dotted deploy" })
+      expect((yield* snapshot.execute(call("a_b_c"))).output).toEqual({ text: "namespaced c" })
+    }).pipe(Effect.provide(Logger.layer([logger])))
+  })
+
+  it.effect("keeps the documented override when the name and namespace match exactly", () =>
+    Effect.gen(function* () {
+      const service = yield* Tool.Service
+      yield* service.transform((editor) => {
+        editor.add({ ...constant("first"), name: "deploy.staging", options: { codemode: false } })
+        editor.add({ ...constant("second"), name: "deploy.staging", options: { codemode: false } })
+      })
+      expect((yield* executeTool(service, call("deploy_staging"))).output).toEqual({ text: "second" })
     }),
   )
 

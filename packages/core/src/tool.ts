@@ -465,6 +465,12 @@ const cloneOptions = (options: Tool.Options | undefined): Tool.Options | undefin
     ...(isRecord(options.codemode) ? { codemode: { ...options.codemode } } : {}),
   }
 
+/** The original registration a tool came from, for collision and error messages. */
+const describeRegistration = (tool: Tool.Info) =>
+  tool.options?.namespace === undefined
+    ? `"${tool.name}"`
+    : `"${tool.name}" (namespace "${tool.options.namespace}")`
+
 /** Store a valid tool under its effective name, or record why it was skipped. */
 function commit(editor: Data, id: string, input: RegisteredTool) {
   // JavaScript plugins may leave out `input` for a tool that takes none.
@@ -480,6 +486,20 @@ function commit(editor: Data, id: string, input: RegisteredTool) {
       name: tool.name,
       namespace: tool.options?.namespace,
       error: registered.failure,
+    })
+    return
+  }
+  const existing = editor.tools.get(id)
+  if (existing && (existing.name !== tool.name || existing.options?.namespace !== tool.options?.namespace)) {
+    // Two visibly different registrations normalize to the same id; keep the first and report both.
+    editor.errors.push({
+      kind: "tool",
+      name: tool.name,
+      namespace: tool.options?.namespace,
+      error: new RegistrationError({
+        name: id,
+        message: `Tool name collision: ${describeRegistration(existing)} and ${describeRegistration(tool)} both normalize to "${id}"`,
+      }),
     })
     return
   }
