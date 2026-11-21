@@ -889,6 +889,13 @@ export const fromRequest = Effect.fn("OpenAIChat.fromRequest")(function* (
   const hasHistory = hasToolHistory(request.messages)
   const hasActiveTools = flattened.tools.length > 0
   const custom = OpenAIFreeform.tools(request)
+  // Strict OpenAI-compatible endpoints reject a body that carries both token-limit
+  // fields (`Extra inputs are not permitted`). When the `http.body` overlay already
+  // sets either one, drop the protocol-generated field so the merged body keeps a
+  // single source of truth.
+  const overlaySetsTokenLimit =
+    request.http?.body !== undefined &&
+    ("max_tokens" in request.http.body || "max_completion_tokens" in request.http.body)
   const lowering = { ...options, cacheControl: options.cacheControl ?? declaredCacheControl(request), custom }
   return {
     model: request.model.id,
@@ -903,9 +910,11 @@ export const fromRequest = Effect.fn("OpenAIChat.fromRequest")(function* (
     stream: true as const,
     ...((request.model.capabilities?.streamUsage ?? true) ? { stream_options: { include_usage: true } } : {}),
     ...(zaiToolStream && hasActiveTools ? { tool_stream: true } : {}),
-    ...(maxTokensField === "max_completion_tokens"
-      ? { max_completion_tokens: request.maxTokens }
-      : { max_tokens: request.maxTokens }),
+    ...(overlaySetsTokenLimit
+      ? {}
+      : maxTokensField === "max_completion_tokens"
+        ? { max_completion_tokens: request.maxTokens }
+        : { max_tokens: request.maxTokens }),
     temperature: request.temperature,
     top_p: request.topP,
     frequency_penalty: request.frequencyPenalty,

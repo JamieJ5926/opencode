@@ -49,11 +49,21 @@ const COMPATIBLE_KEYS = new Set([
   "strictJsonSchema",
 ])
 
+// v1's token-limit options are not forwarded: v2 derives the request token limit
+// from `model.limit.output`, and forwarding them puts `max_tokens` (or
+// `max_completion_tokens`) in the body overlay beside the field the OpenAI Chat
+// protocol generates, which strict OpenAI-compatible endpoints reject.
+const TOKEN_LIMIT_KEYS = new Set(["max_tokens", "max_completion_tokens", "maxTokens", "maxCompletionTokens"])
+
 export function compatibleModel(options: Options) {
   const entries = Object.entries(options)
-  const body = Object.fromEntries(entries.filter(([key]) => !COMPATIBLE_KEYS.has(key)))
+  const body = Object.fromEntries(
+    entries.filter(([key]) => !COMPATIBLE_KEYS.has(key) && !TOKEN_LIMIT_KEYS.has(key)),
+  )
   return {
-    settings: Object.fromEntries(entries.filter(([key]) => COMPATIBLE_KEYS.has(key))),
+    settings: Object.fromEntries(
+      entries.filter(([key]) => COMPATIBLE_KEYS.has(key) && !TOKEN_LIMIT_KEYS.has(key)),
+    ),
     body: Object.keys(body).length ? body : undefined,
   }
 }

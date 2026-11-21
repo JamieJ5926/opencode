@@ -45,6 +45,20 @@ describe("ConfigProviderOptionsV1", () => {
     })
   })
 
+  test("keeps v1 max token options out of the compatible body and settings", () => {
+    expect(
+      ConfigProviderOptionsV1.compatibleModel({
+        max_tokens: 262144,
+        max_completion_tokens: 8192,
+        maxTokens: 262144,
+        maxCompletionTokens: 8192,
+      }),
+    ).toEqual({
+      settings: {},
+      body: undefined,
+    })
+  })
+
   test("keeps model and variant options unchanged", () => {
     expect(
       ConfigProviderOptionsV1.model({

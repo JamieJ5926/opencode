@@ -816,4 +816,38 @@ describe("OpenAI-compatible Chat route", () => {
       })
     }),
   )
+
+  it.effect("omits the generated token-limit field when http.body sets the other one", () =>
+    LLMClient.generate({ ...request, http: { body: { max_completion_tokens: 4096 } } }).pipe(
+      Effect.provide(
+        dynamicResponse((input) =>
+          Effect.gen(function* () {
+            const body = decodeJson(input.text)
+            expect(body).toMatchObject({ max_completion_tokens: 4096 })
+            expect(body).not.toHaveProperty("max_tokens")
+            return input.respond(sseEvents(deltaChunk({ content: "ok" }), deltaChunk({}, "stop")), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          }),
+        ),
+      ),
+    ),
+  )
+
+  it.effect("omits the generated token-limit field when http.body sets max_tokens", () =>
+    LLMClient.generate({ ...copilotRequest, maxTokens: 262144, http: { body: { max_tokens: 262144 } } }).pipe(
+      Effect.provide(
+        dynamicResponse((input) =>
+          Effect.gen(function* () {
+            const body = decodeJson(input.text)
+            expect(body).toMatchObject({ max_tokens: 262144 })
+            expect(body).not.toHaveProperty("max_completion_tokens")
+            return input.respond(sseEvents(deltaChunk({ content: "ok" }), deltaChunk({}, "stop")), {
+              headers: { "content-type": "text/event-stream" },
+            })
+          }),
+        ),
+      ),
+    ),
+  )
 })
