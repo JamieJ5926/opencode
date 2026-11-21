@@ -7,6 +7,7 @@ import type { ShellCreateBefore } from "@opencode/plugin/effect/shell"
 import type { Shell as ShellSchema } from "@opencode/schema/shell"
 import type { Tool } from "@opencode/schema/tool"
 import { Clock, Deferred, Effect, Fiber, Option, Schema, Struct } from "effect"
+import { Bus } from "../../bus.js"
 import { Config } from "../../config.js"
 import { ConfigEntryObserver } from "../../config/plugin/entry-observer.js"
 import { Environment } from "../../environment/index.js"
@@ -16,6 +17,7 @@ import { FileAccess } from "../../file-access.js"
 import { Permission } from "../../permission.js"
 import { NonNegativeInt } from "../../schema.js"
 import { Session } from "../../session.js"
+import { SessionEvent } from "../../session/event.js"
 import { SessionMessage } from "../../session/message.js"
 import { SessionSchema } from "../../session/schema.js"
 import { Shell } from "../../shell.js"
@@ -161,9 +163,51 @@ const backgroundResult = (info: ShellSchema.Info, now: number, timeout?: number)
   status: "running" as const,
 })
 
+// Settles a backgrounded call's stored tool part with its real result. The part was settled as
+// moved to the background when the call returned; without this it would keep `status: "running"`
+// forever, so history, compaction and resume report a finished command as still in flight.
+const settleCall = Effect.fnUntraced(function* (
+  sessions: Pick<Session.Interface, "context">,
+  bus: Pick<Bus.Interface, "publish">,
+  input: { readonly sessionID: SessionSchema.ID; readonly shellID: string },
+  state: "completed" | "error" | "cancelled",
+  text: string,
+  output: Output | undefined,
+) {
+  const content = (output ? resultMessages(output) : [text]).filter((item) => item !== "")
+  const [first, ...rest] = content.length > 0 ? content : ["(no output)"]
+  const messages = yield* sessions
+    .context(input.sessionID)
+    .pipe(Effect.catchTag("Session.NotFoundError", () => Effect.succeed([] as SessionMessage.Info[])))
+  for (const message of messages) {
+    if (message.type !== "assistant") continue
+    for (const part of message.content) {
+      if (part.type !== "tool" || (part.state.status !== "completed" && part.state.status !== "running")) continue
+      if (part.state.metadata?.shellID !== input.shellID || part.state.metadata?.status !== "running") continue
+      yield* bus.publish(SessionEvent.Tool.Success, {
+        sessionID: input.sessionID,
+        assistantMessageID: message.id,
+        id: part.id,
+        content: [
+          { type: "text" as const, text: first },
+          ...rest.map((item) => ({ type: "text" as const, text: item })),
+        ],
+        metadata: {
+          status: state,
+          shellID: input.shellID,
+          ...(output ? ShellResult.metadata(output) : {}),
+        },
+        executed: part.executed === true,
+      })
+      return
+    }
+  }
+})
+
 // Tells the session how a background command ended, once its job settles.
 const notify = Effect.fnUntraced(function* (
-  sessions: Pick<Session.Interface, "synthetic">,
+  sessions: Pick<Session.Interface, "context" | "synthetic">,
+  bus: Pick<Bus.Interface, "publish">,
   jobs: Job.Interface,
   input: {
     readonly sessionID: SessionSchema.ID
@@ -177,6 +221,7 @@ const notify = Effect.fnUntraced(function* (
   if (!info || info.status === "running") return
   const output = info.status === "completed" ? yield* Deferred.await(input.settled) : undefined
   const text = output ? (info.output ?? "") : info.status === "error" ? (info.error ?? "Command failed") : "Cancelled"
+  yield* settleCall(sessions, bus, input, info.status, text, output)
   // A session deleted while its command ran has no one left to tell.
   yield* sessions
     .synthetic({
@@ -275,14 +320,15 @@ export const backgroundToolResult = (info: ShellSchema.Info) => {
 export const reattach = Effect.fnUntraced(function* (input: {
   readonly shell: Shell.Interface
   readonly jobs: Job.Interface
-  readonly sessions: Pick<Session.Interface, "synthetic">
+  readonly bus: Pick<Bus.Interface, "publish">
+  readonly sessions: Pick<Session.Interface, "context" | "synthetic">
   readonly sessionID: SessionSchema.ID
   readonly info: ShellSchema.Info
   // The job's existing durable row, if the previous server had backgrounded it.
   readonly notificationID?: SessionMessage.ID
 }) {
   const { job, settled } = yield* startJob(input.jobs, input.shell, { ...input, background: true })
-  const notifying = notify(input.sessions, input.jobs, {
+  const notifying = notify(input.sessions, input.bus, input.jobs, {
     sessionID: input.sessionID,
     id: job.id,
     shellID: input.info.id,
@@ -304,6 +350,7 @@ export const Plugin = {
   effect: Effect.fn("ShellTool.Plugin")(function* (ctx: Context) {
     const sessions = yield* Session.Service
     const jobs = yield* Job.Service
+    const bus = yield* Bus.Service
     const access = yield* FileAccess.Service
     const environment = yield* Environment.Service
     const workingDirectory = yield* Environment.workingDirectory
@@ -369,7 +416,7 @@ export const Plugin = {
       shellID: string,
       command: string,
       settled: Deferred.Deferred<Output>,
-    ) => shell.watch(notify(sessions, jobs, { sessionID, id, shellID, command, settled }))
+    ) => shell.watch(notify(sessions, bus, jobs, { sessionID, id, shellID, command, settled }))
 
     // Stops the command of a call the user asked to stop, and fails the call with the output so far. The command
     // stays observable, output file included.

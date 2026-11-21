@@ -64,6 +64,7 @@ const pluginSupervisor = makeLocationNode({
   ),
   deps: [
     Agent.node,
+    Bus.node,
     Config.node,
     Environment.node,
     FileAccess.node,

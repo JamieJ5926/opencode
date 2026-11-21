@@ -901,6 +901,12 @@ describe("SessionRestart background recovery", () => {
           yield* Effect.sleep(50)
           expect(yield* notices).toMatchObject([{ id: row?.notificationID, metadata: { shellID: info.id } }])
           if (exited) expect(yield* notices).toMatchObject([{ text: expect.stringContaining("finished output") }])
+          // The notice settles the call's own tool part too, so history, compaction and
+          // resume no longer see the finished command as running (#65438).
+          expect(yield* shellCallState(store, parent)).toMatchObject({
+            status: "completed",
+            metadata: { status: "completed", shellID: info.id, exit: 0 },
+          })
           expect(yield* restarted.pendingBackground).toEqual([])
         }),
     )

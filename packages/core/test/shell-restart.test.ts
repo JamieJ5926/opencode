@@ -169,19 +169,29 @@ describe("shell commands across a graceful restart", () => {
           yield* until(() => turns >= 2)
           const shellID = String(command.pipe?.metadata.id)
           expect(yield* shellCall(resumed, session.id)).toMatchObject([
-            {
-              id: "call-restart",
-              state: {
-                status: "completed",
-                content: [
-                  {
-                    type: "text",
-                    text: expect.stringContaining(`Command moved to the background (shell ID: ${shellID})`),
+            finished
+              ? // The command ended during the restart, so its call settles with the real result (#65438).
+                {
+                  id: "call-restart",
+                  state: {
+                    status: "completed",
+                    metadata: { status: "completed", shellID, exit: 0 },
+                    content: [{ type: "text", text: expect.stringContaining("finished output") }],
                   },
-                  { type: "text", text: expect.stringContaining("You will be notified automatically") },
-                ],
-              },
-            },
+                }
+              : {
+                  id: "call-restart",
+                  state: {
+                    status: "completed",
+                    content: [
+                      {
+                        type: "text",
+                        text: expect.stringContaining(`Command moved to the background (shell ID: ${shellID})`),
+                      },
+                      { type: "text", text: expect.stringContaining("You will be notified automatically") },
+                    ],
+                  },
+                },
           ])
           if (!finished) {
             // The resumed turn ends while the command still runs; its completion wakes the session again.

@@ -47,7 +47,7 @@ export interface Options {
 
 const DEFAULT_MAX_ATTEMPTS = 10
 
-type Notices = Pick<Session.Interface, "synthetic">
+type Notices = Pick<Session.Interface, "context" | "synthetic">
 
 export interface Interface {
   /**
@@ -285,10 +285,13 @@ export const layer = (options?: Options) =>
             ? yield* shell.get(recovery.shellID).pipe(Effect.option)
             : Option.none()
         if (!shell || Option.isNone(info)) return yield* recoverToolJob(background, recovery)
+        // Settled together with its call by the sweep above: watching it again would report it twice.
+        if (reattached.has(info.value.id)) return
         reattached.add(info.value.id)
         yield* ShellTool.reattach({
           shell,
           jobs,
+          bus,
           sessions: notices,
           sessionID: recovery.sessionID,
           info: info.value,
@@ -301,7 +304,7 @@ export const layer = (options?: Options) =>
       const settleBackgroundedCalls = Effect.fnUntraced(function* (
         sessionID: SessionSchema.ID,
         notices: Notices,
-        reattached: ReadonlySet<string>,
+        reattached: Set<string>,
       ) {
         const calls = (yield* SessionHistory.incompleteAssistants(db, sessionID)).flatMap((message) =>
           message.type === "assistant"
@@ -335,9 +338,20 @@ export const layer = (options?: Options) =>
               executed: call.part.executed === true,
             })
             // Backgrounded but stopped before the call was settled: its job row was already reattached (and, for a
-            // command that already finished, may even be done).
+            // command that already finished, may even be done). The row's notification ID stays with the command, so
+            // its notice is admitted through the same durable slot the previous server recorded.
             if (reattached.has(info.id)) return
-            yield* ShellTool.reattach({ shell, jobs, sessions: notices, sessionID, info })
+            reattached.add(info.id)
+            const background = (yield* jobs.pendingBackground).find((item) => item.id === info.id)
+            yield* ShellTool.reattach({
+              shell,
+              jobs,
+              bus,
+              sessions: notices,
+              sessionID,
+              info,
+              notificationID: background?.notificationID,
+            })
           }),
           { discard: true },
         )
@@ -461,6 +475,7 @@ export const layer = (options?: Options) =>
           // Hold notice wakes until every suspended session has counted its attempt, so a woken
           // child cannot settle mid-sweep and wake its parent past that budget.
           const notices: Notices = {
+            context: (sessionID) => sessions.context(sessionID),
             synthetic: (input) =>
               sessions.synthetic({ ...input, resume: false }).pipe(
                 Effect.tap(() => {
@@ -475,9 +490,20 @@ export const layer = (options?: Options) =>
           const recoverable = Effect.fnUntraced(function* (background: Job.Background) {
             return (yield* jobs.get(background.id))?.status !== "running"
           })
-          // Shell and tool outcomes first, then calls a killed server left unsettled, and only then recovered children,
-          // whose first resume would otherwise fail their own unsettled shell calls.
+          // Calls a killed server left unsettled first, so a command reattached below (and its
+          // completion notice) always settles a part that already carries its shell ID; recovered
+          // children come last, whose first resume would otherwise fail their own unsettled shell calls.
           const reattached = new Set<string>()
+          yield* Effect.forEach(
+            suspended,
+            (sessionID) =>
+              settleBackgroundedCalls(sessionID, notices, reattached).pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning("failed to settle backgrounded shell calls", { sessionID, error }),
+                ),
+              ),
+            { discard: true },
+          )
           yield* Effect.forEach(
             pending,
             Effect.fnUntraced(function* (background) {
@@ -487,16 +513,6 @@ export const layer = (options?: Options) =>
               if (recovery.kind === "video") return yield* recoverVideoJob(background, recovery, notices)
               yield* recoverToolJob(background, recovery)
             }),
-            { discard: true },
-          )
-          yield* Effect.forEach(
-            suspended,
-            (sessionID) =>
-              settleBackgroundedCalls(sessionID, notices, reattached).pipe(
-                Effect.catch((error) =>
-                  Effect.logWarning("failed to settle backgrounded shell calls", { sessionID, error }),
-                ),
-              ),
             { discard: true },
           )
           const resumable: ResumableSubagent[] = []

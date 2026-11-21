@@ -139,6 +139,7 @@ const shellPluginSupervisor = makeLocationNode({
   name: "test/shell-plugins",
   layer: Layer.effectDiscard(registerToolPlugin(ShellTool.Plugin)),
   deps: [
+    Bus.node,
     Config.node,
     Environment.node,
     FileAccess.node,
@@ -1304,6 +1305,7 @@ describe("ShellTool", () => {
             }),
           ),
           deps: [
+            Bus.node,
             Config.node,
             Environment.node,
             FileAccess.node,

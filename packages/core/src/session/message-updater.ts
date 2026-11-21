@@ -367,6 +367,24 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
                   ...(event.data.metadata === undefined ? {} : { metadata: event.data.metadata }),
                 }),
               )
+            } else if (
+              match.state.status === "completed" &&
+              match.state.metadata?.status === "running" &&
+              match.state.metadata?.shellID !== undefined &&
+              match.state.metadata?.shellID === event.data.metadata?.shellID
+            ) {
+              // A backgrounded shell command finished after its call was settled as moved to the
+              // background: replace the moved-to-background result with the real one, so history,
+              // compaction and resume no longer see the command as running.
+              match.time.completed = created
+              match.state = castDraft(
+                SessionMessage.ToolStateCompleted.make({
+                  status: "completed",
+                  input: match.state.input,
+                  content: event.data.content,
+                  metadata: event.data.metadata,
+                }),
+              )
             }
           },
         )

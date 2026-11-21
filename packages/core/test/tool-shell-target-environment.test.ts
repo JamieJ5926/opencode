@@ -7,6 +7,7 @@ import { LayerNode } from "@opencode/util/effect/layer-node"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Global } from "@opencode/util/global"
 import { Config } from "@opencode/core/config"
+import { Bus } from "@opencode/core/bus"
 import { Environment } from "@opencode/core/environment/index"
 import { FileAccess } from "@opencode/core/file-access"
 import { Flag } from "@opencode/core/flag"
@@ -34,6 +35,7 @@ const shellToolNode = makeLocationNode({
   name: "test/shell-tool-plugin",
   layer: Layer.effectDiscard(registerToolPlugin(ShellTool.Plugin)),
   deps: [
+    Bus.node,
     Config.node,
     Environment.node,
     FileAccess.node,
