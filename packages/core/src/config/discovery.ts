@@ -18,6 +18,8 @@ export interface Sources {
   /** macOS MDM managed preferences plist (`ai.opencode.managed`), when one is deployed. */
   readonly preferences?: AbsolutePath
   readonly global?: AbsolutePath
+  /** The location project's VCS root when one exists; watch planning stops here. */
+  readonly projectRoot?: AbsolutePath
   readonly explicit?: AbsolutePath
   readonly direct: readonly AbsolutePath[]
   readonly project: readonly { readonly path: AbsolutePath; readonly present: boolean }[]
@@ -86,10 +88,16 @@ export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options
     { concurrency: "unbounded" },
   )
   const current = yield* fs.resolve(location.directory)
-  const directories =
+  const globalLocation =
     globalRoots.slice(0, configDirectories.length).includes(current) || options?.project === false
-      ? []
-      : yield* fs.up({ targets: ["."], start: location.directory }).pipe(Effect.orDie)
+  // The project's VCS root, in the same unresolved path space as the walk below. The search for
+  // existing config still runs to the filesystem root, but a candidate above the root that does
+  // not exist is another project's or the user's to create, and recording it made every location
+  // plan a watch on every ancestor up to "/".
+  const projectRoot = globalLocation ? undefined : yield* Project.root(fs, location.directory)
+  const directories = globalLocation
+    ? []
+    : yield* fs.up({ targets: ["."], start: location.directory }).pipe(Effect.orDie)
   const candidates = [".claude", ".agents", ".opencode", ...names.toReversed()]
   const discovered = yield* Effect.forEach(
     directories,
@@ -103,7 +111,7 @@ export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options
           Effect.map((list) => new Set(list.map((entry) => entry.toLowerCase()))),
           Effect.orElseSucceed(() => undefined),
         )
-        return yield* Effect.forEach(
+        const found = yield* Effect.forEach(
           candidates,
           (name) => {
             const item = AbsolutePath.make(path.join(directory, name))
@@ -116,6 +124,11 @@ export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options
           },
           { concurrency: "unbounded" },
         )
+        // Past the project root only config that exists today is recorded: an absent candidate
+        // there would plan a watch on every ancestor up to "/" for this location.
+        return projectRoot !== undefined && !FSUtil.contains(projectRoot, directory)
+          ? found.filter((entry) => !entry.missing)
+          : found
       }),
     { concurrency: "unbounded" },
   ).pipe(
@@ -150,6 +163,7 @@ export const discover = Effect.fn("ConfigDiscovery.discover")(function* (options
     system: globalEnabled && system ? { path: system, present: yield* fs.isDir(system) } : undefined,
     preferences,
     global: globalEnabled ? globalDirectory : undefined,
+    projectRoot,
     explicit: options?.file ? AbsolutePath.make(path.resolve(options.file)) : undefined,
     direct: visible.filter((item) => ![".agents", ".claude", ".opencode"].includes(path.basename(item))).toReversed(),
     project: yield* Effect.forEach(

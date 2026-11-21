@@ -52,8 +52,18 @@ export function plan(sources: ConfigDiscovery.Sources) {
     ...(sources.explicit ? [sources.explicit] : []),
   ]
   // Keep a parent watch for each root so deletion/recreation is observable.
+  // A candidate that is known to be missing and sits above the project's root is not this
+  // project's config to anticipate: watching it would plan a watch on every ancestor up to "/".
+  const absent = new Set(
+    sources.project.filter((candidate) => !candidate.present).map((candidate) => key(candidate.path)),
+  )
   const parents = Map.groupBy(
-    files.filter((file) => !directories.some((directory) => file !== directory && FSUtil.contains(directory, file))),
+    files.filter((file) => {
+      if (sources.projectRoot !== undefined && absent.has(key(file)) && !FSUtil.contains(sources.projectRoot, file)) {
+        return false
+      }
+      return !directories.some((directory) => file !== directory && FSUtil.contains(directory, file))
+    }),
     (file) => path.dirname(file),
   )
   return new Map(
