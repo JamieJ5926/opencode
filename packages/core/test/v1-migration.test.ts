@@ -1308,9 +1308,19 @@ describe("V1Migration database workflow", () => {
         expect(yield* db.get(sql`SELECT value FROM kv WHERE key = 'migration.v1-v2.global-sessions'`)).toEqual({
           value: '{"phase":"completed"}',
         })
-        // A second run is a no-op: the repair marker skips the sweep.
+        // A second run is a no-op: the repair marker skips the sweep, so a V1 session that arrived
+        // after the first run stays under global instead of being attributed.
+        yield* db.run(sql`
+          INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+          VALUES ('ses_late', 'global', 'ses_late', ${plain}, 'Test', '1', 1, 2)
+        `)
+        yield* db.run(sql`
+          INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+          VALUES ('ses_late', 'global', 'ses_late', ${plain}, 'Test', '1', 1, 2)
+        `)
         expect(yield* V1Migration.run()).toEqual({ status: "completed" })
         expect(yield* db.all(sql`SELECT id, project_id, path, time_updated FROM session_v2 ORDER BY id`)).toEqual([
+          { id: "ses_late", project_id: "global", path: null, time_updated: 2 },
           { id: "ses_missing", project_id: "global", path: null, time_updated: 2 },
           { id: "ses_native", project_id: "global", path: null, time_updated: 2 },
           { id: "ses_plain", project_id: owners.plain.id, path: "", time_updated: 2 },

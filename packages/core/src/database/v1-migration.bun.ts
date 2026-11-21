@@ -778,25 +778,34 @@ export function run(
 
 // Imports that completed before global sessions were attributed left them under global, hidden from
 // V2's per-folder session lists. Resolve each folder once, the same way the import does, and move only
-// sessions that came from V1 and are still under global. Updated times are kept.
+// sessions that came from V1 and are still under global. Updated times are kept. The marker is only
+// written after a full sweep, so a pass stopped by a timeout is retried on the next run; the updates
+// themselves only touch rows still under global, so a repeat is a no-op.
 function repairGlobalSessions(db: Database.Interface["db"]) {
   return Effect.gen(function* () {
-    if (yield* db.get(sql`SELECT 1 FROM kv WHERE key = ${REPAIR_STATE_KEY}`)) return
-    const folders = yield* db.all<{ directory: string; time_updated: number }>(sql`
-      SELECT directory, MAX(time_updated) AS time_updated
-      FROM session_v2
-      WHERE project_id = ${Project.ID.global} AND workspace_id IS NULL AND directory != ''
-        AND EXISTS (SELECT 1 FROM session WHERE session.id = session_v2.id)
-      GROUP BY directory
-    `)
+    if (yield* db.get(sql`SELECT 1 FROM kv WHERE key = ${REPAIR_STATE_KEY}`).pipe(Effect.orDie)) return
+    const folders = (
+      yield* db
+        .all<{ directory: string; time_updated: number }>(sql`
+          SELECT directory, MAX(time_updated) AS time_updated
+          FROM session_v2
+          WHERE project_id = ${Project.ID.global} AND workspace_id IS NULL AND directory != ''
+            AND EXISTS (SELECT 1 FROM session WHERE session.id = session_v2.id)
+          GROUP BY directory
+        `)
+        .pipe(Effect.orDie)
+    ).filter((folder) => storedAbsolutePath(folder.directory) !== undefined)
+    let swept = true
     for (const [index, folder] of folders.entries()) {
       updateProgress({ label: "Repairing V1 sessions", numerator: index, denominator: folders.length })
       const resolved = yield* resolveDirectory(folder.directory)
-      // One hung folder (e.g. a dead network mount) usually means more; leave the rest under global.
+      // One hung folder (e.g. a dead network mount) usually means more; leave the rest under global
+      // and leave the marker unwritten so the next run retries the rest.
       if (Option.isNone(resolved)) {
         yield* Effect.logWarning("Stopped repairing V1 global sessions after a timeout", {
           directory: folder.directory,
         })
+        swept = false
         break
       }
       const owner = resolved.value
@@ -825,6 +834,7 @@ function repairGlobalSessions(db: Database.Interface["db"]) {
         )
         .pipe(Effect.orDie)
     }
+    if (!swept) return
     yield* db
       .insert(KVTable)
       .values({ key: REPAIR_STATE_KEY, value: { phase: "completed" } })
