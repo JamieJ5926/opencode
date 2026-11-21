@@ -436,6 +436,7 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
                                                                                 packages={input.packages}
                                                                                 directories={pluginDirectories}
                                                                               >
+                                                                                <PermissionAutoApprover />
                                                                                 <App />
                                                                               </PluginProvider>
                                                                             </PanelProvider>
@@ -489,6 +490,37 @@ export const run = Effect.fn("Tui.run")(function* (input: TuiInput) {
     if (text) process.stdout.write(text + "\n")
   })
 })
+
+// Auto-approves permission asks for every session on the connection while --auto is on.
+// Lives outside the session route because a background tab never mounts one: its asks must
+// be answered without the tab being selected. Mirrors the web client's
+// createPermissionAutoApprover (packages/app/src/session/requests/auto-approve.ts).
+function PermissionAutoApprover() {
+  const data = useData()
+  const local = useLocal()
+  const toast = useToast()
+  const autoApproved = new Set<string>()
+  createEffect(() => {
+    if (local.permission.mode !== "autoaccept") return
+    for (const sessionID of data.session.permission.sessions()) {
+      for (const request of data.session.permission.list(sessionID) ?? []) {
+        if (autoApproved.has(request.id)) continue
+        autoApproved.add(request.id)
+        void data.session.permission
+          .reply({
+            sessionID: request.sessionID,
+            decision: "once",
+            requestID: request.id,
+          })
+          .catch((error) => {
+            autoApproved.delete(request.id)
+            toast.error(error)
+          })
+      }
+    }
+  })
+  return null
+}
 
 function App() {
   const app = useTuiApp()
