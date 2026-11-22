@@ -47,7 +47,7 @@ export interface Options {
 
 const DEFAULT_MAX_ATTEMPTS = 10
 
-type Notices = Pick<Session.Interface, "context" | "synthetic">
+type Notices = Pick<Session.Interface, "messages" | "synthetic">
 
 export interface Interface {
   /**
@@ -350,6 +350,7 @@ export const layer = (options?: Options) =>
               sessions: notices,
               sessionID,
               info,
+              callID: call.part.id,
               notificationID: background?.notificationID,
             })
           }),
@@ -475,7 +476,7 @@ export const layer = (options?: Options) =>
           // Hold notice wakes until every suspended session has counted its attempt, so a woken
           // child cannot settle mid-sweep and wake its parent past that budget.
           const notices: Notices = {
-            context: (sessionID) => sessions.context(sessionID),
+            messages: (input) => sessions.messages(input),
             synthetic: (input) =>
               sessions.synthetic({ ...input, resume: false }).pipe(
                 Effect.tap(() => {

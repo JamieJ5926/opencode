@@ -165,11 +165,13 @@ const backgroundResult = (info: ShellSchema.Info, now: number, timeout?: number)
 
 // Settles a backgrounded call's stored tool part with its real result. The part was settled as
 // moved to the background when the call returned; without this it would keep `status: "running"`
-// forever, so history, compaction and resume report a finished command as still in flight.
+// forever, so history, compaction and resume report a finished command as still in flight. The
+// read is the unbounded transcript, not the compaction-bounded context, so a command that
+// outlives a compaction still settles.
 const settleCall = Effect.fnUntraced(function* (
-  sessions: Pick<Session.Interface, "context">,
+  sessions: Pick<Session.Interface, "messages">,
   bus: Pick<Bus.Interface, "publish">,
-  input: { readonly sessionID: SessionSchema.ID; readonly shellID: string },
+  input: { readonly sessionID: SessionSchema.ID; readonly shellID: string; readonly callID?: string },
   state: "completed" | "error" | "cancelled",
   text: string,
   output: Output | undefined,
@@ -177,13 +179,19 @@ const settleCall = Effect.fnUntraced(function* (
   const content = (output ? resultMessages(output) : [text]).filter((item) => item !== "")
   const [first, ...rest] = content.length > 0 ? content : ["(no output)"]
   const messages = yield* sessions
-    .context(input.sessionID)
+    .messages({ sessionID: input.sessionID, order: "asc" })
     .pipe(Effect.catchTag("Session.NotFoundError", () => Effect.succeed([] as SessionMessage.Info[])))
   for (const message of messages) {
     if (message.type !== "assistant") continue
     for (const part of message.content) {
       if (part.type !== "tool" || (part.state.status !== "completed" && part.state.status !== "running")) continue
-      if (part.state.metadata?.shellID !== input.shellID || part.state.metadata?.status !== "running") continue
+      // The command may exit between the notify fork and the placeholder publish, while the
+      // call's own part is still bare running with no shell ID: a known call ID settles it, and
+      // the projector ignores the late placeholder over a part that already carries the result.
+      const matches =
+        (part.state.metadata?.shellID === input.shellID && part.state.metadata?.status === "running") ||
+        (input.callID !== undefined && part.id === input.callID && part.state.status === "running")
+      if (!matches) continue
       yield* bus.publish(SessionEvent.Tool.Success, {
         sessionID: input.sessionID,
         assistantMessageID: message.id,
@@ -206,7 +214,7 @@ const settleCall = Effect.fnUntraced(function* (
 
 // Tells the session how a background command ended, once its job settles.
 const notify = Effect.fnUntraced(function* (
-  sessions: Pick<Session.Interface, "context" | "synthetic">,
+  sessions: Pick<Session.Interface, "messages" | "synthetic">,
   bus: Pick<Bus.Interface, "publish">,
   jobs: Job.Interface,
   input: {
@@ -214,6 +222,7 @@ const notify = Effect.fnUntraced(function* (
     readonly id: string
     readonly shellID: string
     readonly command: string
+    readonly callID?: string
     readonly settled: Deferred.Deferred<Output>
   },
 ) {
@@ -321,9 +330,12 @@ export const reattach = Effect.fnUntraced(function* (input: {
   readonly shell: Shell.Interface
   readonly jobs: Job.Interface
   readonly bus: Pick<Bus.Interface, "publish">
-  readonly sessions: Pick<Session.Interface, "context" | "synthetic">
+  readonly sessions: Pick<Session.Interface, "messages" | "synthetic">
   readonly sessionID: SessionSchema.ID
   readonly info: ShellSchema.Info
+  // The tool call whose part a completion notice settles, when the caller knows it. The restart
+  // sweep passes it, so a notice settles its part even before the sweep's placeholder projects.
+  readonly callID?: string
   // The job's existing durable row, if the previous server had backgrounded it.
   readonly notificationID?: SessionMessage.ID
 }) {
@@ -333,6 +345,7 @@ export const reattach = Effect.fnUntraced(function* (input: {
     id: job.id,
     shellID: input.info.id,
     command: input.info.command,
+    callID: input.callID,
     settled,
   })
   const current = yield* input.shell.get(input.info.id).pipe(Effect.option)
@@ -415,8 +428,9 @@ export const Plugin = {
       id: string,
       shellID: string,
       command: string,
+      callID: string,
       settled: Deferred.Deferred<Output>,
-    ) => shell.watch(notify(sessions, bus, jobs, { sessionID, id, shellID, command, settled }))
+    ) => shell.watch(notify(sessions, bus, jobs, { sessionID, id, shellID, command, callID, settled }))
 
     // Stops the command of a call the user asked to stop, and fails the call with the output so far. The command
     // stays observable, output file included.
@@ -531,7 +545,7 @@ export const Plugin = {
 
                   if (background) {
                     yield* jobs.background(job.id)
-                    yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
+                    yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, context.id, settled)
                     return backgroundResult(info, yield* Clock.currentTimeMillis)
                   }
 
@@ -572,7 +586,7 @@ export const Plugin = {
                     yield* shell.timeout(info.id, 0)
                     const elapsed = "timedOut" in result ? finalTimeout : undefined
                     finalTimeout = 0
-                    yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, settled)
+                    yield* notifyWhenDone(context.sessionID, job.id, info.id, info.command, context.id, settled)
                     return backgroundResult(info, yield* Clock.currentTimeMillis, elapsed)
                   }
                   if (result?.info.status === "error")

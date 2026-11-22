@@ -1,15 +1,21 @@
+import path from "path"
 import type { FileSystem } from "@opencode/core/filesystem"
 import { describe, expect, test } from "bun:test"
-import { AIError, TransportError } from "@opencode/ai/effect"
+import { AIError, LanguageModel, LLMClient, TransportError } from "@opencode/ai/effect"
+import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
+import { TestLLM } from "@opencode/ai/testing"
 import { Money } from "@opencode/schema/money"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
+import { LayerNodePlatform } from "@opencode/core/effect/app-node-platform"
 import { LayerNode } from "@opencode/util/effect/layer-node"
+import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Bus } from "@opencode/core/bus"
 import { Instance } from "@opencode/core/instance/service"
 import { Job } from "@opencode/core/job"
 import { JobTable } from "@opencode/core/job/sql"
 import { KV } from "@opencode/core/kv"
+import { Watcher } from "@opencode/core/filesystem/watcher"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import type { LocationServices } from "@opencode/core/location-services"
 import { Project } from "@opencode/core/project"
@@ -22,9 +28,14 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunner } from "@opencode/core/session/runner/index"
-import { SessionInboxTable, SessionTable } from "@opencode/core/session/sql"
+import { SessionRunnerModel } from "@opencode/core/session/runner/model"
+import { SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { Shell } from "@opencode/core/shell"
+import { PersistentPty } from "@opencode/core/persistent-pty"
+import { Plugin } from "@opencode/core/plugin"
+import { Permission } from "@opencode/core/permission"
+import { ShellTool } from "@opencode/core/tool/plugin/shell"
 import { BlobStore } from "@opencode/core/blob-store"
 import { Environment } from "@opencode/core/environment/index"
 import { VideoGeneration } from "@opencode/core/video-generation"
@@ -33,10 +44,16 @@ import { FSUtil } from "@opencode/util/fs-util"
 import { Global } from "@opencode/util/global"
 import { tmpdirScoped } from "./fixture/tmpdir"
 import { Agent } from "@opencode/core/agent"
-import { ID } from "@opencode/core/model"
+import { ID, Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { daemonShells } from "./fixture/shell-daemon"
+import { recordingEnvironmentLayer } from "./fixture/environment"
+import { tempGlobalLayer } from "./fixture/global"
+import { offlineModels } from "./fixture/models"
+import { fakeDaemon } from "./fixture/persistent-pty-daemon"
+import { permissionLayer } from "./lib/permission"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Logger, Schedule, Scope, Stream } from "effect"
+import type { ChildProcess } from "effect/process"
 import { eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -2297,8 +2314,250 @@ function shellNotices(store: SessionStore.Interface, sessionID: Session.ID) {
   return store
     .context(sessionID)
     .pipe(
-      Effect.map((messages) =>
-        messages.filter((message) => message.type === "synthetic" && message.metadata?.source === "shell"),
+      Effect.map(
+        (messages) =>
+          messages.filter((message) => message.type === "synthetic" && message.metadata?.source === "shell"),
       ),
     )
 }
+
+// The live background path races its own placeholder: notify() is forked before the runner
+// publishes the moved-to-background Tool.Success, and the settle read is bounded by the latest
+// completed compaction. These tests pin both, through the real plugin, runner, bus and store.
+describe("live background shell settle", () => {
+  const itApp = testEffect(tempGlobalLayer)
+  const idleCommand = process.platform === "win32" ? "Start-Sleep -Seconds 60" : "sleep 60"
+
+  // Holds the runner's placeholder publish for a backgrounded call while set, so the window
+  // between the notify fork and the placeholder publish is observed deterministically. The
+  // wrapper bus serves the whole app; its inner is an equivalent configured bus instance.
+  let holdPlaceholder: Deferred.Deferred<void> | undefined
+  const heldBus = Bus.node.replace(
+    makeGlobalNode({
+      service: Bus.Service,
+      deps: [Bus.configured()],
+      layer: Layer.effect(
+        Bus.Service,
+        Effect.gen(function* () {
+          const inner = yield* Bus.Service
+          const publish: Bus.Interface["publish"] = (definition, data, options) => {
+            const hold =
+              holdPlaceholder !== undefined &&
+              definition.type === SessionEvent.Tool.Success.type &&
+              (data as { metadata?: { status?: string } }).metadata?.status === "running"
+                ? Deferred.await(holdPlaceholder)
+                : Effect.void
+            return Effect.andThen(hold, () => inner.publish(definition, data, options))
+          }
+          return Bus.Service.of({ ...inner, publish })
+        }),
+      ),
+    }),
+  )
+
+  const model = SessionRunnerModel.node.replace(
+    Layer.succeed(SessionRunnerModel.Service, {
+      select: (session) => Effect.fail(new SessionRunnerModel.ModelNotSelectedError({ sessionID: session.id })),
+      resolve: () =>
+        Effect.succeed(
+          SessionRunnerModel.resolved(LanguageModel.make({ id: "restart", provider: "test", route: OpenAIChat.route }), {
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+            cost: [],
+            limit: { context: 200_000, output: 32_000 },
+          }),
+        ),
+    }),
+  )
+
+  const world = Effect.gen(function* () {
+    const daemon = yield* fakeDaemon()
+    const root = (yield* tmpdirScoped()).path
+    const data = path.join(root, "data")
+    const global = Global.layerWith({
+      data,
+      cache: path.join(root, "cache"),
+      config: path.join(root, "config"),
+      state: path.join(root, "state"),
+      tmp: path.join(root, "tmp"),
+      bin: path.join(root, "cache", "bin"),
+      log: path.join(data, "log"),
+      repos: path.join(data, "repos"),
+    })
+    const database = yield* Layer.build(Database.layer())
+    const llm = yield* Layer.build(TestLLM.testLayer({ fallback: TestLLM.text("Done", "done") }))
+    const project = (yield* tmpdirScoped()).path
+    // Every command the servers spawn instead of handing to the daemon.
+    const spawns: ChildProcess.Command[] = []
+    const server = (scope: Scope.Scope) =>
+      Layer.buildWithScope(
+        AppNodeBuilder.build(
+          LayerNode.group([
+            PersistentPty.node,
+            Shell.daemonNode,
+            Session.node,
+            LocationServiceMap.node,
+            SessionRestart.node,
+          ]),
+          [
+            Global.node.replace(global),
+            Database.node.replace(Layer.succeedContext(database)),
+            LayerNodePlatform.llmClient.replace(Layer.succeedContext(Context.pick(LLMClient.Service)(llm))),
+            PersistentPty.node.replace(PersistentPty.configured(daemon.options)),
+            Environment.node.replace(recordingEnvironmentLayer(spawns)),
+            Permission.node.replace(permissionLayer({ assert: () => Effect.void })),
+            Watcher.node.replace(Watcher.configured({ enabled: false })),
+            offlineModels,
+            model,
+            heldBus,
+          ],
+        ),
+        scope,
+      )
+    return { daemon, llm: Context.get(llm, TestLLM.Test), project, server }
+  })
+
+  const until = (check: () => boolean) =>
+    Effect.gen(function* () {
+      while (!check()) yield* Effect.sleep(5)
+    })
+
+  const callState = (sessions: Session.Interface, sessionID: Session.ID) =>
+    sessions.messages({ sessionID, order: "asc" }).pipe(
+      Effect.map((messages) =>
+        messages.flatMap((message) =>
+          message.type === "assistant" ? message.content.filter((part) => part.type === "tool") : [],
+        ),
+      ),
+      Effect.map((parts) => parts[0]?.state),
+    )
+
+  itApp.live("settles a call whose command exits before the placeholder publish", () =>
+    Effect.gen(function* () {
+      const { daemon, llm, project, server } = yield* world
+      let turns = 0
+      yield* llm.serve((request) =>
+        request.tools.some((tool) => tool.name === "shell") && turns++ === 0
+          ? TestLLM.toolCall("call-window", "shell", { command: idleCommand, background: true })
+          : TestLLM.text("Done", "done"),
+      )
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const one = yield* server(scope)
+      const sessions = Context.get(one, Session.Service)
+      const session = yield* sessions.create({
+        location: { directory: AbsolutePath.make(project) },
+        agent: Agent.ID.make("build"),
+        model: Model.Ref.make({ id: Model.ID.make("restart"), providerID: Provider.ID.make("test") }),
+      })
+      yield* Plugin.Service.use((plugins) => plugins.awaitActivation).pipe(
+        Effect.provide(Context.get(one, LocationServiceMap.Service).get(session.location)),
+      )
+      holdPlaceholder = yield* Deferred.make<void>()
+      const prompt = yield* sessions.prompt({ sessionID: session.id, text: "run it" }).pipe(Effect.forkIn(scope))
+      yield* until(() => daemon.processes.length === 1)
+      const shellID = String(daemon.processes[0]!.pipe?.metadata.id)
+      daemon.exit(daemon.processes[0]!.id, 0)
+      // notify() settles before it admits the notice, so a part that completes while the
+      // placeholder is still held carries the real result, not the placeholder's.
+      let ran = false
+      for (let i = 0; i < 150 && !ran; i++) {
+        ran = (yield* callState(sessions, session.id))?.status === "completed"
+        if (!ran) yield* Effect.sleep(5)
+      }
+      const midState = yield* callState(sessions, session.id)
+      if (midState?.status === "completed")
+        expect(midState).toMatchObject({
+          status: "completed",
+          metadata: { status: "completed", shellID, exit: 0 },
+        })
+      // The turn ends once the placeholder is finally published, and the late placeholder does
+      // not resurrect "running": the part keeps the real result either way.
+      yield* Deferred.succeed(holdPlaceholder!, undefined)
+      yield* Fiber.join(prompt)
+      expect(yield* callState(sessions, session.id)).toMatchObject({
+        status: "completed",
+        metadata: { status: "completed", shellID, exit: 0 },
+      })
+      holdPlaceholder = undefined
+    }),
+    60_000,
+  )
+
+  it.live("settles a backgrounded shell call that outlives a compaction", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const store = yield* SessionStore.Service
+      const bus = yield* Bus.Service
+      const jobs = yield* Job.Service
+      const parent = Session.ID.make("ses_background_shell_compacted")
+      yield* seedSessions(database, [parent], { time_suspended: Date.now() })
+      const assistantMessageID = yield* seedShellCall(bus, parent, "call-shell")
+      const daemon = yield* daemonShells()
+      const info = yield* daemon.withShell("/project", (shell) =>
+        shell.create({
+          shell: "/bin/sh",
+          command: "work",
+          cwd: "/tmp",
+          waited: true,
+          toolCall: { sessionID: parent, assistantMessageID, callID: "call-shell" },
+        }),
+      )
+      // The previous server settled the call as moved to the background before it died.
+      const placeholder = ShellTool.backgroundToolResult(info)
+      const [first, ...rest] = placeholder.content
+      yield* bus.publish(SessionEvent.Tool.Success, {
+        sessionID: parent,
+        assistantMessageID,
+        id: "call-shell",
+        content: [first, ...rest],
+        metadata: placeholder.metadata,
+        executed: true,
+      })
+      // The session then completed a compaction, whose bound hides everything before it,
+      // including the call's own part.
+      yield* database.db
+        .insert(SessionMessageTable)
+        .values({
+          id: SessionMessage.ID.create(),
+          session_id: parent,
+          type: "compaction",
+          seq: 5,
+          time_created: 0,
+          data: { status: "completed", reason: "auto", summary: "Earlier work", time: { created: 0 } },
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* Bus.reserveSequence(database.db, parent, 5)
+      yield* seedBackground(jobs, parent, [{ id: info.id, shellID: info.id, command: "work" }])
+      daemon.daemon.output(1, "finished output\n")
+      daemon.daemon.exit(1, 0)
+
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const restarted = yield* Job.make.pipe(Effect.provideService(Scope.Scope, scope))
+      const shell = yield* daemon.openShell("/project").pipe(Effect.provideService(Scope.Scope, scope))
+      const context = yield* buildExecution(
+        scope,
+        ({ sessionID }) => SessionInbox.promote(database.db, bus, sessionID, "steer").pipe(Effect.asVoid),
+        undefined,
+        restarted,
+        shell,
+      )
+      yield* Context.get(context, SessionRestart.Service).resumeSuspendedSessions
+
+      const seen = shellNotices(store, parent)
+      while ((yield* seen).length < 1) yield* Effect.sleep(5)
+      // The settle read is the unbounded store, so the notice settles the call's own part
+      // even though it sits before the compaction (#65438).
+      const parts = yield* store.messages({ sessionID: parent, order: "asc" })
+      const [part] = parts.flatMap((message) =>
+        message.type === "assistant" ? message.content.filter((item) => item.type === "tool") : [],
+      )
+      expect(part?.type === "tool" ? part.state : undefined).toMatchObject({
+        status: "completed",
+        metadata: { status: "completed", shellID: info.id, exit: 0 },
+      })
+      expect(yield* restarted.pendingBackground).toEqual([])
+    }),
+  )
+})
