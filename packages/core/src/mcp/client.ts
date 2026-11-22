@@ -812,14 +812,23 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
     server,
     message: explain(error),
     answered: !repeats(error),
-    transient:
-      isTransient(error) ||
-      // A server that did not answer in time, or an authorization server that could not refresh for now,
-      // is down for now too. Refused credentials would fail the same way until they change, so they are not.
-      (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout) ||
-      (error instanceof OAuthError && error.code === OAuthErrorCode.TemporarilyUnavailable),
+    transient: retryable(error),
   })
 })
+
+// What a failed connect reports for a background retry: an outage (isTransient), a server that did not
+// answer in time, or an authorization server that could not refresh for now. Refused credentials would
+// fail the same way until they change, so they are not. The auto probe wraps its failures in an
+// EraNegotiationFailed, so the wrapped cause decides, as it does in `repeats`.
+const retryable = (error: unknown): boolean => {
+  if (error instanceof SdkError && error.code === SdkErrorCode.EraNegotiationFailed && error.cause !== undefined)
+    return retryable(error.cause)
+  return (
+    isTransient(error) ||
+    (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout) ||
+    (error instanceof OAuthError && error.code === OAuthErrorCode.TemporarilyUnavailable)
+  )
+}
 
 // Connecting again would fail the same way: the server could not be spawned or reached, did not answer in
 // time, is overloaded or down for now, or refused this client's access. A failed auto probe wraps the error it hit.

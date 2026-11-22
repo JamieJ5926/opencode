@@ -112,6 +112,8 @@ export function make(input: Input): Connection {
     reconnect?: number
     reconnectDelay?: number
   } = {}
+  /** Last issued reconnect generation; only ever increases, so a stale timer never matches a new one. */
+  let reconnectGen = 0
 
   // Runs a connection callback under the lock, dropping it if the connection is no longer the live
   // client, so late SDK callbacks cannot commit obsolete state.
@@ -176,7 +178,7 @@ export function make(input: Input): Connection {
   const scheduleReconnect = () => {
     const delay = state.reconnectDelay ?? RECONNECT_FIRST_DELAY
     state.reconnectDelay = Math.min(delay * 2, RECONNECT_MAX_DELAY)
-    const gen = (state.reconnect ?? 0) + 1
+    const gen = ++reconnectGen
     state.reconnect = gen
     input.fork(
       Effect.sleep(Duration.millis(delay)).pipe(

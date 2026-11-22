@@ -2642,6 +2642,22 @@ testEffect(Layer.empty).live(
   60_000,
 )
 
+// A server that is unreachable wraps its probe failure in an EraNegotiationFailed; the wrapped network
+// error is what decides whether the server gets a background reconnect.
+test("classifies an unreachable remote server's failure as transient", async () => {
+  const error = await Effect.runPromise(
+    Effect.scoped(
+      connect(
+        "unreachable",
+        new ConfigMCP.Remote({ type: "remote", url: "http://127.0.0.1:9", oauth: false }),
+        import.meta.dir,
+      ),
+    ).pipe(Effect.flip),
+  )
+  expect(error).toBeInstanceOf(McpClient.ConnectError)
+  expect((error as McpClient.ConnectError).transient).toBe(true)
+})
+
 testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog updates", () =>
   Effect.gen(function* () {
     const tool = (server: string, name: string, description = name) =>
