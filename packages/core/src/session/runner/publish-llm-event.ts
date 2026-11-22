@@ -69,6 +69,8 @@ const INPUT_FAILURES = {
 export interface StepRecord {
   /** The model produced visible output this attempt, which bars transparent retries and overflow recovery. */
   readonly outputStarted: boolean
+  /** The model produced something the user can see — text or a tool call — and not reasoning alone. */
+  readonly visibleOutput: boolean
   readonly providerFailed: boolean
   /** The step's recorded assistant failure, if any. */
   readonly failure?: SessionError.Error
@@ -124,6 +126,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
   let stepStarted = false
   let providerFailed = false
   let outputStarted = false
+  let visibleOutput = false
   let stepFailure: SessionError.Error | undefined
   let stepSettlement: StepRecord["finish"]
 
@@ -439,6 +442,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
         return
       case "text-start":
         outputStarted = true
+        visibleOutput = true
         const startedTextOrdinal = yield* text.start(event.id, native(event.providerMetadata))
         yield* publishPendingDeltas()
         yield* bus.publish(SessionEvent.Text.Started, {
@@ -492,6 +496,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
         return
       case "tool-call": {
         outputStarted = true
+        visibleOutput = true
         const tool = tools.get(event.id) ?? (yield* startToolInput(event))
         if (toolInput.has(event.id)) yield* endToolInput(event)
         if (tool.name !== event.name)
@@ -617,6 +622,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       providerFailed,
       failure: stepFailure,
       finish: stepSettlement,
+      visibleOutput,
       needsContinuation: Iterable.some(
         tools.values(),
         (tool) => !tool.providerExecuted && (tool.called || tool.settled),

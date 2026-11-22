@@ -889,10 +889,18 @@ const fragmentFixture = (kind: FragmentKind, id: string, chunks: readonly string
         completeEvents: [
           ...partialEvents,
           LLMEvent.reasoningEnd({ id }),
+          // A stop over reasoning alone is an incomplete stream, so the settled step carries text too.
+          LLMEvent.textStart({ id: `${id}-answer` }),
+          LLMEvent.textDelta({ id: `${id}-answer`, text: "Done" }),
+          LLMEvent.textEnd({ id: `${id}-answer`, text: "Done" }),
           LLMEvent.stepFinish({ index: 0, reason: { normalized: "stop" } }),
           LLMEvent.finish({ reason: { normalized: "stop" } }),
         ],
-        expectedAssistant: { type: "assistant", finish: "stop", content: [expectedContent] },
+        expectedAssistant: {
+          type: "assistant",
+          finish: "stop",
+          content: [expectedContent, { type: "text", text: "Done" }],
+        },
         expectedContent,
       }
     }
@@ -4382,6 +4390,9 @@ describe("SessionRunnerLLM", () => {
             anthropic: { ignored: true },
           },
         }),
+        LLMEvent.textStart({ id: "text" }),
+        LLMEvent.textDelta({ id: "text", text: "Done" }),
+        LLMEvent.textEnd({ id: "text", text: "Done" }),
       ),
     )
     yield* s.resume
@@ -4400,6 +4411,7 @@ describe("SessionRunnerLLM", () => {
           text: "Encrypted thought",
           native: { itemId: "rs_1", reasoningEncryptedContent: "encrypted-state" },
         },
+        { type: "text", text: "Done" },
       ]),
     ])
 
@@ -4418,6 +4430,7 @@ describe("SessionRunnerLLM", () => {
         text: "Encrypted thought",
         providerMetadata: { openai: { itemId: "rs_1", reasoningEncryptedContent: "encrypted-state" } },
       },
+      { type: "text", text: "Done" },
     ])
   })
 

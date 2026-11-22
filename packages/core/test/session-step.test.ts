@@ -161,6 +161,95 @@ for (const fixture of [
   )
 }
 
+// A step whose only output is reasoning, driven to a chosen finish reason and retry decision.
+const attemptReasoningOnly = (how: {
+  finish: "stop" | "length"
+  retry: (retryable: boolean) => Effect.Effect<{ retry: true; attempt: number; delay: number } | { retry: false }>
+}) =>
+  Effect.gen(function* () {
+    const db = (yield* Database.Service).db
+    const llm = yield* TestLLM.Test
+    const sessionID = Session.ID.create()
+    const assistantMessageID = SessionMessage.ID.create()
+    const steps = yield* SessionStep.make.pipe(
+      Effect.provide(
+        Layer.mock(Snapshot.Service)({
+          capture: () => Effect.succeed(undefined),
+          files: () => Effect.succeed([]),
+        }),
+      ),
+    )
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .run()
+    yield* db
+      .insert(SessionTable)
+      .values({ id: sessionID, project_id: Project.ID.global, slug: "step", directory: "/project", version: "test" })
+      .run()
+    const model = SessionRunnerModel.resolved(
+      LanguageModel.make({ id: "test-model", provider: "test", route: OpenAIChat.route }),
+      {
+        capabilities: { tools: true, input: ["text"], output: ["text"] },
+        limit: { context: 100_000, output: 1_000 },
+        cost: [],
+      },
+    )
+    yield* llm.push(
+      TestLLM.complete(
+        { reason: { normalized: how.finish }, usage: { inputTokens: 10, outputTokens: 4, nonCachedInputTokens: 10 } },
+        LLMEvent.reasoningStart({ id: "reasoning" }),
+        LLMEvent.reasoningDelta({ id: "reasoning", text: "thinking" }),
+        LLMEvent.reasoningEnd({ id: "reasoning" }),
+      ),
+    )
+    return yield* steps
+      .attempt({
+        isLocationClosed: () => false,
+        sessionID,
+        assistantMessageID,
+        agent: Agent.defaultID,
+        model,
+        prepared: {
+          retry: () => Effect.void,
+          request: ai.request({ model: model.model, prompt: "Hello" }),
+          options: {},
+          executeTool: () => Effect.die("no tools"),
+        },
+        retry: (_cause, _error, retryable) => how.retry(retryable),
+        recoverContinuation: true,
+        recoverOverflow: Effect.succeed(false),
+      })
+      .pipe(Effect.exit)
+  })
+
+it.effect("retries a stop turn that produced only reasoning", () =>
+  Effect.gen(function* () {
+    const result = yield* attemptReasoningOnly({
+      finish: "stop",
+      retry: (retryable) => Effect.succeed(retryable ? { retry: true, attempt: 2, delay: 0 } : { retry: false }),
+    })
+    expect(Exit.isSuccess(result)).toBe(true)
+    if (Exit.isSuccess(result)) expect(result.value).toMatchObject({ _tag: "Retry", freshAssistant: true })
+  }),
+)
+
+it.effect("fails a stop turn that produced only reasoning when the retry policy declines", () =>
+  Effect.gen(function* () {
+    const result = yield* attemptReasoningOnly({ finish: "stop", retry: () => Effect.succeed({ retry: false }) })
+    const failure = Exit.isFailure(result) ? (Cause.squash(result.cause) as { _tag: string }) : undefined
+    expect(failure?._tag).toBe("Session.StepFailedError")
+  }),
+)
+
+it.effect("still settles a reasoning-only output limit without retrying", () =>
+  Effect.gen(function* () {
+    const result = yield* attemptReasoningOnly({ finish: "length", retry: () => Effect.succeed({ retry: false }) })
+    expect(Exit.isSuccess(result)).toBe(true)
+    if (Exit.isSuccess(result)) expect(result.value).toEqual(SessionStep.Outcome.OutputLimit({ needsContinuation: false }))
+  }),
+)
+
 it.effect("records the cost the endpoint reports instead of the catalog price", () =>
   Effect.gen(function* () {
     const db = (yield* Database.Service).db

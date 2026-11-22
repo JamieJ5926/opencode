@@ -213,16 +213,23 @@ export const make = Effect.gen(function* () {
         }
 
         const recorded = publisher.record()
-        const unknownFinish =
-          Exit.isSuccess(stream) && recorded.finish?.finish === "unknown"
+        // A stop over reasoning alone streamed something but showed the user nothing, so it is an incomplete
+        // stream and recovers like one instead of settling the turn.
+        const emptyFinish =
+          Exit.isSuccess(stream) &&
+          (recorded.finish?.finish === "unknown" ||
+            (recorded.finish?.finish === "stop" && recorded.outputStarted && !recorded.visibleOutput))
             ? new AIError({
                 reason: new InvalidProviderOutputError({
-                  message: "The provider response ended with an unknown finish reason.",
+                  message:
+                    recorded.finish?.finish === "unknown"
+                      ? "The provider response ended with an unknown finish reason."
+                      : "The provider ended the turn with a stop finish reason and no visible output.",
                   classification: "incomplete-stream",
                 }),
               })
             : undefined
-        const llmFailure = streamFailure instanceof AIError ? streamFailure : unknownFinish
+        const llmFailure = streamFailure instanceof AIError ? streamFailure : emptyFinish
         const llmError = llmFailure && !recorded.providerFailed ? toSessionError(llmFailure) : undefined
         const tokens = recorded.finish?.usage
         yield* Effect.annotateCurrentSpan({
