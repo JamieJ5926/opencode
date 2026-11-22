@@ -112,11 +112,13 @@ function request(state: ActiveState, event: Extract<FileContentEvent, { type: "l
 
   if (entry?.status === "loading" || entry?.status === "refreshing") {
     const silent = entry.silent && event.silent
-    const rerun = entry.rerun || event.force
+    // A request proves a tab is back, so a close marked during this read no longer holds: the read runs once more
+    // after it settles, and its result is fresh again.
+    const rerun = entry.rerun || event.force || entry.closed
 
-    if (silent === entry.silent && rerun === entry.rerun) return unchanged(state)
+    if (!entry.closed && silent === entry.silent && rerun === entry.rerun) return unchanged(state)
 
-    return changed(put(state, event.path, { ...entry, silent, rerun }))
+    return changed(put(state, event.path, { ...entry, silent, rerun, closed: false }))
   }
 
   if (entry?.status === "ready" && !entry.stale && !event.force) return unchanged(state)

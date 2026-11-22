@@ -37,12 +37,12 @@ describe("FileWatch", () => {
     Effect.gen(function* () {
       const fileWatch = yield* FileWatch.Service
       const a = file("a.ts")
-      expect(yield* fileWatch.watching(a.file)).toBe(false)
+      expect(yield* fileWatch.watching(a)).toBe(false)
       yield* fileWatch.watch(a)
-      expect(yield* fileWatch.watching(a.file)).toBe(true)
-      expect(yield* fileWatch.watching(file("b.ts").file)).toBe(false)
+      expect(yield* fileWatch.watching(a)).toBe(true)
+      expect(yield* fileWatch.watching(file("b.ts"))).toBe(false)
       yield* fileWatch.unwatch(a)
-      expect(yield* fileWatch.watching(a.file)).toBe(false)
+      expect(yield* fileWatch.watching(a)).toBe(false)
     }),
   )
 

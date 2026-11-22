@@ -634,6 +634,14 @@ describe("LocationWatcher subscriptions", () => {
             )
             expect(Option.isSome(suppressed)).toBe(false)
 
+            // The per-file watch never reports an add, so the create still flows for the tree's parent refresh.
+            expect(
+              yield* nextUpdate(
+                (event) => event.file === file,
+                Queue.offer(directoryUpdates, { type: "create", path: file }).pipe(Effect.asVoid),
+              ),
+            ).toEqual({ file, event: "add" })
+
             yield* fileWatch.unwatch(input)
             expect(
               yield* nextUpdate(

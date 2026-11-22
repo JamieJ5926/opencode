@@ -187,6 +187,35 @@ describe("file content machine", () => {
     expect(step.effects).toEqual([read(3)])
   })
 
+  test("a request that joins a closed read clears the close and runs once more after it", () => {
+    const loaded = replay([requested(), succeeded(1, before)]).state
+    const refreshing = transitionFileContent(loaded, requested(true, true)).state
+    const closed = transitionFileContent(refreshing, { type: "file.closed", paths: ["a.ts"] })
+
+    // What invalidateFromWatcher issues for a change, and what a reopen's sync joins with.
+    const joined = transitionFileContent(closed.state, requested(true, true))
+
+    expect(entry(joined.state)).toEqual({
+      status: "refreshing",
+      content: before,
+      attempt: 2,
+      silent: true,
+      rerun: true,
+      closed: false,
+    })
+
+    const settled = transitionFileContent(joined.state, succeeded(2, before))
+
+    expect(settled.effects).toEqual([
+      { type: "cache.store", path: "a.ts", content: before },
+      read(3),
+    ])
+
+    const reread = transitionFileContent(settled.state, succeeded(3, after))
+
+    expect(entry(reread.state)).toEqual({ status: "ready", content: after, stale: false })
+  })
+
   // Reloading a missing file used to keep `notFound` beside `loading`.
   test("reloading a missing file shows it loading, not missing", () => {
     const gone = replay([requested(), missing(1)]).state

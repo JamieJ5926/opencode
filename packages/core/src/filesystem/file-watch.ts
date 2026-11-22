@@ -41,8 +41,8 @@ export interface Interface {
   /** Starts watching a file, or resets its expiry when it is already watched. */
   readonly watch: (input: Input) => Effect.Effect<void, DisabledError>
   readonly unwatch: (input: Input) => Effect.Effect<void>
-  /** Whether any location currently watches the file, so a workspace directory watch can skip double-publishing its change. */
-  readonly watching: (file: string) => Effect.Effect<boolean>
+  /** Whether this location currently watches the file, so a workspace directory watch can skip double-publishing its change. */
+  readonly watching: (input: Input) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/FileWatch") {}
@@ -60,7 +60,11 @@ export const layer = (options?: Options) =>
     Service,
     Effect.gen(function* () {
       if (options?.enabled === false) {
-        return Service.of({ watch: () => Effect.fail(new DisabledError()), unwatch: () => Effect.void, watching: () => Effect.succeed(false) })
+        return Service.of({
+          watch: () => Effect.fail(new DisabledError()),
+          unwatch: () => Effect.void,
+          watching: () => Effect.succeed(false),
+        })
       }
       const watcher = yield* Watcher.Service
       const bus = yield* Bus.Service
@@ -155,13 +159,8 @@ export const layer = (options?: Options) =>
             }),
           ),
         unwatch: (input) => lock.withPermit(stop(locationKey(input.location), input.file)),
-        watching: (file) =>
-          Effect.sync(() => {
-            for (const files of locations.values()) {
-              if (files.has(file)) return true
-            }
-            return false
-          }),
+        watching: (input) =>
+          Effect.sync(() => locations.get(locationKey(input.location))?.has(input.file) ?? false),
       })
     }),
   )

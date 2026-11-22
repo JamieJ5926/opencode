@@ -31,8 +31,14 @@ const layer = Layer.effect(
     const fileWatch = yield* FileWatch.Service
     const publish = (update: { type: "create" | "update" | "delete"; path: string }) =>
       Effect.gen(function* () {
-        // A file a tab opened has its own per-file watch publishing the same change; the directory watch stays quiet for it.
-        if (yield* fileWatch.watching(update.path)) return
+        // A file a tab opened has its own per-file watch publishing the same change, so the directory watch stays
+        // quiet for the update itself. It still publishes the create and delete: the per-file watch reports an
+        // exists check, never an add, and the tree refreshes a parent listing only on add and unlink.
+        if (
+          update.type === "update" &&
+          (yield* fileWatch.watching({ location: { directory: location.directory, workspaceID: location.workspaceID }, file: update.path }))
+        )
+          return
         yield* bus.publish(FileSystem.Event.Changed, {
           file: update.path,
           event: update.type === "create" ? "add" : update.type === "update" ? "change" : "unlink",
