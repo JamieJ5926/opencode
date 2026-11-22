@@ -2,7 +2,7 @@ export * as McpConnection from "./connection.js"
 
 import type { AuthProvider } from "@modelcontextprotocol/client"
 import type { Mcp } from "@opencode/schema/mcp"
-import { Cause, Effect, Exit, Scope } from "effect"
+import { Cause, Duration, Effect, Exit, Scope } from "effect"
 import { FetchHttpClient } from "effect/http"
 import { Environment } from "../environment/index.js"
 import { KeyedMutex } from "../effect/keyed-mutex.js"
@@ -16,6 +16,12 @@ export type Kind = "tools" | "prompts" | "resources"
 // Unshared connections to one remote endpoint, from any number of Locations, take turns at their
 // handshake so the endpoint does not receive a startup burst.
 const endpointLoads = KeyedMutex.makeUnsafe<string>()
+
+// A remote server that is down or overloaded when the startup window gives up on it usually recovers on
+// its own, so a transient failure retries in the background: 5 s after the failure, doubling up to a
+// 5 min cap, reset by a successful connect, until the server connects or the connection is stopped.
+const RECONNECT_FIRST_DELAY = 5_000
+const RECONNECT_MAX_DELAY = 5 * 60_000
 
 /**
  * What a connection reports to its owner. Each runs inline, in order, so the owner can keep its own
@@ -102,6 +108,9 @@ export function make(input: Input): Connection {
     client?: McpClient.Connection
     tools?: ReadonlyArray<McpClient.Tool>
     prompts?: ReadonlyArray<McpClient.Prompt>
+    /** Generation of the pending background reconnect; a newer attempt or a stop supersedes it. */
+    reconnect?: number
+    reconnectDelay?: number
   } = {}
 
   // Runs a connection callback under the lock, dropping it if the connection is no longer the live
@@ -161,8 +170,28 @@ export function make(input: Input): Connection {
     client.onResourcesChanged(() => live(input.events.changed("resources")))
   }
 
+  // Schedules one background re-attempt after a delay that doubles up to the cap. The generation makes a
+  // late timer stand down once a newer attempt or a stop took over: removing or disabling the server
+  // stops the connection, and service shutdown interrupts the forked fiber.
+  const scheduleReconnect = () => {
+    const delay = state.reconnectDelay ?? RECONNECT_FIRST_DELAY
+    state.reconnectDelay = Math.min(delay * 2, RECONNECT_MAX_DELAY)
+    const gen = (state.reconnect ?? 0) + 1
+    state.reconnect = gen
+    input.fork(
+      Effect.sleep(Duration.millis(delay)).pipe(
+        Effect.andThen(
+          input.lock(
+            Effect.suspend(() => (state.reconnect === gen && state.client === undefined ? start : Effect.void)),
+          ),
+        ),
+      ),
+    )
+  }
+
   const start: Effect.Effect<void> = Effect.suspend(() =>
     Effect.gen(function* () {
+      state.reconnect = undefined
       yield* input.events.connecting
       // Checked before the OAuth provider is built, which parses the URL too.
       if (input.config.type === "remote" && !URL.canParse(input.config.url))
@@ -209,6 +238,7 @@ export function make(input: Input): Connection {
         state.client = result.value.client
         state.tools = result.value.tools
         state.prompts = []
+        state.reconnectDelay = undefined
         watch(result.value.client)
         yield* input.events.connected
         whenLive(result.value.client)(refreshPrompts(result.value.client))
@@ -223,6 +253,8 @@ export function make(input: Input): Connection {
           : { status: "failed", error: error instanceof Error ? error.message : String(error) },
         error instanceof McpClient.ConnectError && error.answered === true,
       )
+      // A remote server that failed transiently may recover on its own; retry it in the background.
+      if (config.type === "remote" && McpClient.isTransient(error)) scheduleReconnect()
     }).pipe(
       Effect.ensuring(input.events.settled),
       Effect.annotateLogs({ server: input.name, directory: input.directory, connectionID: crypto.randomUUID() }),
@@ -230,6 +262,7 @@ export function make(input: Input): Connection {
   )
 
   const stop = Effect.gen(function* () {
+    state.reconnect = undefined
     const scope = state.scope
     if (!scope) return
     state.scope = undefined

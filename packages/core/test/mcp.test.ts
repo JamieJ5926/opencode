@@ -2565,6 +2565,83 @@ testEffect(Layer.empty).live("finishes an MCP disconnect whose caller is interru
   }),
 )
 
+testEffect(Layer.empty).live("recovers a remote server whose brief outage ends within its startup window", () =>
+  Effect.gen(function* () {
+    let outage = true
+    const server = yield* resourceServer({
+      resources: false,
+      respond: async (request) => {
+        const body: unknown = request.method === "POST" ? await request.clone().json() : undefined
+        if (typeof body === "object" && body !== null && "method" in body && body.method === "initialize" && outage) {
+          outage = false
+          return new Response(null, { status: 503 })
+        }
+        return undefined
+      },
+    })
+    yield* Effect.gen(function* () {
+      const service = yield* Mcp.Service
+      yield* awaitStatus(service, "connected")
+      expect((yield* service.tools()).length).toBeGreaterThan(0)
+      // The startup window retried the one failed handshake and connected on it.
+      expect(server.state.initializations).toBe(2)
+    }).pipe(
+      Effect.provide(
+        resourceMcpLayer(new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false, protocol: "legacy" })),
+      ),
+    )
+  }),
+)
+
+testEffect(Layer.empty).live(
+  "reconnects a remote server that is down past its startup window once it is healthy",
+  () =>
+    Effect.gen(function* () {
+      let first = 0
+      let initializations = 0
+      const server = yield* resourceServer({
+        resources: false,
+        respond: async (request) => {
+          const body: unknown = request.method === "POST" ? await request.clone().json() : undefined
+          if (typeof body === "object" && body !== null && "method" in body && body.method === "initialize") {
+            initializations += 1
+            if (first === 0) first = Date.now()
+            // The outage outlasts the startup window configured below, so every in-window attempt fails.
+            if (Date.now() - first < 2_000) return new Response(null, { status: 503 })
+          }
+          return undefined
+        },
+      })
+      yield* Effect.gen(function* () {
+        const service = yield* Mcp.Service
+        // The startup window retries the transient failure, then gives up on a server that is still down.
+        yield* awaitStatus(service, "failed")
+        expect(initializations).toBe(3)
+        // Once the server is healthy again it connects on its own, without a manual connect or a restart.
+        yield* service.servers().pipe(
+          Effect.map((servers) => servers.find((item) => item.name === "resources")?.status),
+          Effect.filterOrFail((current) => current?.status === "connected"),
+          Effect.retry({ times: 2_000, schedule: Schedule.spaced("10 millis") }),
+          Effect.timeout("30 seconds"),
+        )
+        expect((yield* service.tools()).length).toBeGreaterThan(0)
+      }).pipe(
+        Effect.provide(
+          resourceMcpLayer(
+            new ConfigMCP.Remote({
+              type: "remote",
+              url: server.url,
+              oauth: false,
+              protocol: "legacy",
+              timeout: { startup: 2_000 },
+            }),
+          ),
+        ),
+      )
+    }),
+  60_000,
+)
+
 testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog updates", () =>
   Effect.gen(function* () {
     const tool = (server: string, name: string, description = name) =>

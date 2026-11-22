@@ -63,10 +63,12 @@ const describe = (error: unknown) => {
 // Overloaded or restarting servers and dropped connections usually recover within a second.
 // Fetch reports network failures as a TypeError carrying a system error code.
 // 501 means the server will never support the request.
-const isTransient = (error: unknown) =>
-  error instanceof SdkHttpError
-    ? error.status === 408 || error.status === 429 || (error.status >= 500 && error.status !== 501)
-    : error instanceof TypeError && "code" in error
+export const isTransient = (error: unknown) =>
+  error instanceof ConnectError
+    ? error.transient === true
+    : error instanceof SdkHttpError
+      ? error.status === 408 || error.status === 429 || (error.status >= 500 && error.status !== 501)
+      : error instanceof TypeError && "code" in error
 
 // MCP Events (SEP-3415), a draft extension. Every `notifications/events/*` names its stream by the JSON-RPC id of
 // the `events/stream` request that opened it.
@@ -165,6 +167,8 @@ export class ConnectError extends Schema.TaggedError<ConnectError>()("MCP.Connec
   message: Schema.String,
   /** The server was reached but refused or broke the handshake, so different connect options might succeed. */
   answered: Schema.optional(Schema.Boolean),
+  /** The server was down, overloaded or unreachable for now, so connecting again later can succeed. */
+  transient: Schema.optional(Schema.Boolean),
 }) {}
 
 /** A legacy Streamable HTTP server no longer recognizes this connection's session; the lifecycle reconnects. */
@@ -804,7 +808,17 @@ export const connect = Effect.fnUntraced(function* (options: ConnectOptions) {
       server,
       message: `${error.message}; the server supports ${error.supported.join(", ")}. Set "protocol" for this server to one of those or to "legacy".`,
     })
-  return yield* new ConnectError({ server, message: explain(error), answered: !repeats(error) })
+  return yield* new ConnectError({
+    server,
+    message: explain(error),
+    answered: !repeats(error),
+    transient:
+      isTransient(error) ||
+      // A server that did not answer in time, or an authorization server that could not refresh for now,
+      // is down for now too. Refused credentials would fail the same way until they change, so they are not.
+      (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout) ||
+      (error instanceof OAuthError && error.code === OAuthErrorCode.TemporarilyUnavailable),
+  })
 })
 
 // Connecting again would fail the same way: the server could not be spawned or reached, did not answer in
