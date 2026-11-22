@@ -10,6 +10,7 @@ import { Git } from "../git.js"
 import { Location } from "../location.js"
 import { Plugin } from "../plugin.js"
 import { Ignore } from "./ignore.js"
+import { FileWatch } from "./file-watch.js"
 import { LocationWatcherPolicy } from "./location-watcher-policy.js"
 import { Protected } from "./protected.js"
 import { Watcher } from "./watcher.js"
@@ -27,10 +28,15 @@ const layer = Layer.effect(
     const fs = yield* FSUtil.Service
     const git = yield* Git.Service
     const policy = yield* LocationWatcherPolicy.Service
+    const fileWatch = yield* FileWatch.Service
     const publish = (update: { type: "create" | "update" | "delete"; path: string }) =>
-      bus.publish(FileSystem.Event.Changed, {
-        file: update.path,
-        event: update.type === "create" ? "add" : update.type === "update" ? "change" : "unlink",
+      Effect.gen(function* () {
+        // A file a tab opened has its own per-file watch publishing the same change; the directory watch stays quiet for it.
+        if (yield* fileWatch.watching(update.path)) return
+        yield* bus.publish(FileSystem.Event.Changed, {
+          file: update.path,
+          event: update.type === "create" ? "add" : update.type === "update" ? "change" : "unlink",
+        })
       })
     const target = yield* Effect.cached(
       Effect.gen(function* () {
@@ -151,5 +157,5 @@ const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Watcher.node, FSUtil.node, Location.node, Git.node, Bus.node, Plugin.node, LocationWatcherPolicy.node],
+  deps: [Watcher.node, FSUtil.node, Location.node, Git.node, Bus.node, Plugin.node, LocationWatcherPolicy.node, FileWatch.node],
 })

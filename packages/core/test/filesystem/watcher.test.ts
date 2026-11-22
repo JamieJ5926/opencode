@@ -13,6 +13,7 @@ import { Bus } from "@opencode/core/bus"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Ignore } from "@opencode/core/filesystem/ignore"
 import { LocationWatcher } from "@opencode/core/filesystem/location-watcher"
+import { FileWatch } from "@opencode/core/filesystem/file-watch"
 import { LocationWatcherPolicy } from "@opencode/core/filesystem/location-watcher-policy"
 import { Watcher } from "@opencode/core/filesystem/watcher"
 import { FileSystem } from "@opencode/schema/filesystem"
@@ -592,6 +593,54 @@ describe("LocationWatcher subscriptions", () => {
             expect(yield* nextUpdate((event) => event.file === file, send("create"))).toEqual({ file, event: "add" })
             expect(yield* nextUpdate((event) => event.file === file, send("update"))).toEqual({ file, event: "change" })
             expect(yield* nextUpdate((event) => event.file === file, send("delete"))).toEqual({ file, event: "unlink" })
+          }),
+        { vcs: "git", watcher },
+      )
+    }),
+  )
+
+  it.live("stays quiet for a file whose tab already watches it", () =>
+    Effect.gen(function* () {
+      const subscriptions: Watcher.WatchInput[] = []
+      // One queue per subscription, so an update offered to the directory watch cannot reach the file watch.
+      const directoryUpdates = yield* Queue.make<Watcher.Update>()
+      const fileUpdates = yield* Queue.make<Watcher.Update>()
+      const watcher = Layer.succeed(
+        Watcher.Service,
+        Watcher.Service.of({
+          subscribe: (input) =>
+            Effect.sync(() => subscriptions.push(input)).pipe(
+              Effect.as(input.type === "directory" ? Stream.fromQueue(directoryUpdates) : Stream.fromQueue(fileUpdates)),
+            ),
+        }),
+      )
+      return withTmp(
+        (directory) =>
+          Effect.gen(function* () {
+            const fileWatch = yield* FileWatch.Service
+            yield* LocationWatcher.Service
+            yield* Effect.sync(() => subscriptions.length).pipe(
+              Effect.filterOrFail((count) => count === 2),
+              Effect.retry(Schedule.spaced("10 millis")),
+            )
+            const file = path.join(directory, "main.txt")
+            const input = { location: { directory: AbsolutePath.make(directory) }, file }
+            yield* fileWatch.watch(input)
+            // The tab's per-file watch publishes this change; the directory watch stays quiet for the same save.
+            const suppressed = yield* maybeNextUpdate(
+              (event) => event.file === file,
+              Queue.offer(directoryUpdates, { type: "update", path: file }).pipe(Effect.asVoid),
+              "200 millis",
+            )
+            expect(Option.isSome(suppressed)).toBe(false)
+
+            yield* fileWatch.unwatch(input)
+            expect(
+              yield* nextUpdate(
+                (event) => event.file === file,
+                Queue.offer(directoryUpdates, { type: "update", path: file }).pipe(Effect.asVoid),
+              ),
+            ).toEqual({ file, event: "change" })
           }),
         { vcs: "git", watcher },
       )

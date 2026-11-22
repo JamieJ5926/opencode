@@ -74,7 +74,7 @@ describe("file content machine", () => {
     const joined = replay([requested(), requested(true, true)])
 
     expect(joined.effects).toEqual([])
-    expect(entry(joined.state)).toEqual({ status: "loading", attempt: 1, silent: false, rerun: true })
+    expect(entry(joined.state)).toEqual({ status: "loading", attempt: 1, silent: false, rerun: true, closed: false })
 
     const first = transitionFileContent(joined.state, succeeded(1, before))
 
@@ -101,6 +101,7 @@ describe("file content machine", () => {
       attempt: 3,
       silent: false,
       rerun: false,
+      closed: false,
     })
   })
 
@@ -131,6 +132,7 @@ describe("file content machine", () => {
       attempt: 3,
       silent: true,
       rerun: false,
+      closed: false,
     })
   })
 
@@ -157,7 +159,7 @@ describe("file content machine", () => {
     expect(entry(reopened.state)).toEqual({ status: "ready", content: after, stale: false })
   })
 
-  test("a close keeps the content a refresh is reading and reruns it once it settles", () => {
+  test("a close during a read keeps the content and lands it stale, so the reopen rereads", () => {
     const loaded = replay([requested(), succeeded(1, before)]).state
     const refreshing = transitionFileContent(loaded, requested(true, true)).state
     const closed = transitionFileContent(refreshing, { type: "file.closed", paths: ["a.ts"] })
@@ -167,16 +169,22 @@ describe("file content machine", () => {
       content: before,
       attempt: 2,
       silent: true,
-      rerun: true,
+      rerun: false,
+      closed: true,
     })
 
     const settled = transitionFileContent(closed.state, succeeded(2, before))
 
-    expect(entry(settled.state)).toEqual({ status: "refreshing", content: before, attempt: 3, silent: true, rerun: false })
+    // No second read starts for a tab that is gone, and the watch is gone with it, so the result is not fresh.
     expect(settled.effects).toEqual([
       { type: "cache.store", path: "a.ts", content: before },
-      read(3),
+      { type: "settle", path: "a.ts" },
     ])
+    expect(entry(settled.state)).toEqual({ status: "ready", content: before, stale: true })
+
+    const step = transitionFileContent(settled.state, requested())
+
+    expect(step.effects).toEqual([read(3)])
   })
 
   // Reloading a missing file used to keep `notFound` beside `loading`.
@@ -210,7 +218,7 @@ describe("file content machine", () => {
     const joined = replay([requested(false, true), requested()])
 
     expect(joined.effects).toEqual([])
-    expect(entry(joined.state)).toEqual({ status: "loading", attempt: 1, silent: false, rerun: false })
+    expect(entry(joined.state)).toEqual({ status: "loading", attempt: 1, silent: false, rerun: false, closed: false })
 
     const step = transitionFileContent(joined.state, failed(1))
 
@@ -241,7 +249,7 @@ describe("file content machine", () => {
 
     expect(step.effects).toEqual([])
     expect(view(step.state)).toBeUndefined()
-    expect(entry(step.state, "b.ts")).toEqual({ status: "loading", attempt: 3, silent: true, rerun: false })
+    expect(entry(step.state, "b.ts")).toEqual({ status: "loading", attempt: 3, silent: true, rerun: false, closed: false })
     expect(selectFileLoading(entry(step.state, "b.ts"))).toBe(true)
 
     const settled = transitionFileContent(step.state, succeeded(3, before, "b.ts"))

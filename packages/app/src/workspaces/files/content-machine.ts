@@ -9,7 +9,14 @@ import type { FileState } from "./types"
 // server that sends no response, which arrives here as `load.failed`, and a large file may download for as long as it
 // needs.
 export type FileEntryState =
-  | { readonly status: "loading"; readonly attempt: number; readonly silent: boolean; readonly rerun: boolean }
+  | {
+      readonly status: "loading"
+      readonly attempt: number
+      readonly silent: boolean
+      readonly rerun: boolean
+      // A close during this read: the watch is gone, so the settling result lands stale.
+      readonly closed: boolean
+    }
   | { readonly status: "ready"; readonly content: FileContent; readonly stale: boolean }
   | {
       readonly status: "refreshing"
@@ -17,6 +24,7 @@ export type FileEntryState =
       readonly attempt: number
       readonly silent: boolean
       readonly rerun: boolean
+      readonly closed: boolean
     }
   | { readonly status: "missing"; readonly error: string }
   | { readonly status: "error"; readonly error: string }
@@ -128,6 +136,14 @@ function complete(state: ActiveState, event: ResultEvent) {
   if (event.type === "load.succeeded") {
     const store: FileContentEffect = { type: "cache.store", path: event.path, content: event.content }
 
+    // The tab closed while this read ran: its watch is gone, so what the read found is the last known content and
+    // the next plain load reads again. No further read starts for a tab that is gone.
+    if (entry.closed)
+      return changed(put(state, event.path, { status: "ready", content: event.content, stale: true }), [
+        store,
+        { type: "settle", path: event.path },
+      ])
+
     // Show what this read found, then read again for the change reported during it.
     if (entry.rerun) return start(state, event.path, event.content, entry.silent, [store])
 
@@ -138,7 +154,7 @@ function complete(state: ActiveState, event: ResultEvent) {
   }
 
   // A failure that a later change already outdated is not reported: read again and keep what the tab shows.
-  if (entry.rerun) return start(state, event.path, shown, entry.silent)
+  if (entry.rerun && !entry.closed) return start(state, event.path, shown, entry.silent)
 
   const toast: FileContentEffect[] = entry.silent ? [] : [{ type: "toast", message: event.error }]
 
@@ -178,14 +194,16 @@ function evict(state: ActiveState, paths: readonly string[]) {
 
     if (entry.status !== "refreshing") return []
 
-    return [[path, { status: "loading", attempt: entry.attempt, silent: entry.silent, rerun: entry.rerun }]]
+    return [
+      [path, { status: "loading", attempt: entry.attempt, silent: entry.silent, rerun: entry.rerun, closed: entry.closed }],
+    ]
   })
 
   return changed({ ...state, files: Object.fromEntries(files) })
 }
 
 // A closed tab stops its file's watch, so the content shown is no longer known fresh. Keep it on screen — another tab
-// may still be showing it — and let the next plain load read again; a read in flight runs once more when it settles.
+// may still be showing it — and let the next plain load read again; a read in flight lands stale when it settles.
 function stale(state: ActiveState, paths: readonly string[]) {
   const marked = new Set(
     paths.filter((path) => {
@@ -193,7 +211,7 @@ function stale(state: ActiveState, paths: readonly string[]) {
 
       if (!entry) return false
       if (entry.status === "ready") return !entry.stale
-      return entry.status !== "missing" && entry.status !== "error" && !entry.rerun
+      return entry.status !== "missing" && entry.status !== "error" && !entry.closed
     }),
   )
 
@@ -202,7 +220,7 @@ function stale(state: ActiveState, paths: readonly string[]) {
   const files = Object.entries(state.files).map(([path, entry]): [string, FileEntryState] => {
     if (entry.status === "ready") return [path, marked.has(path) ? { ...entry, stale: true } : entry]
     if (entry.status === "missing" || entry.status === "error") return [path, entry]
-    return [path, marked.has(path) ? { ...entry, rerun: true } : entry]
+    return [path, marked.has(path) ? { ...entry, closed: true } : entry]
   })
 
   return changed({ ...state, files: Object.fromEntries(files) })
@@ -218,8 +236,8 @@ function start(
   const attempt = state.issued + 1
 
   const entry: FileEntryState = content
-    ? { status: "refreshing", content, attempt, silent, rerun: false }
-    : { status: "loading", attempt, silent, rerun: false }
+    ? { status: "refreshing", content, attempt, silent, rerun: false, closed: false }
+    : { status: "loading", attempt, silent, rerun: false, closed: false }
 
   return changed({ ...put(state, path, entry), issued: attempt }, [
     ...effects,

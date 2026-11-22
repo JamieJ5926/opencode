@@ -33,6 +33,19 @@ const subscriptions = Effect.gen(function* () {
 })
 
 describe("FileWatch", () => {
+  it.effect("reports whether a file is watched", () =>
+    Effect.gen(function* () {
+      const fileWatch = yield* FileWatch.Service
+      const a = file("a.ts")
+      expect(yield* fileWatch.watching(a.file)).toBe(false)
+      yield* fileWatch.watch(a)
+      expect(yield* fileWatch.watching(a.file)).toBe(true)
+      expect(yield* fileWatch.watching(file("b.ts").file)).toBe(false)
+      yield* fileWatch.unwatch(a)
+      expect(yield* fileWatch.watching(a.file)).toBe(false)
+    }),
+  )
+
   it.effect("shares one watch per file and resubscribes after unwatch", () =>
     Effect.gen(function* () {
       const fileWatch = yield* FileWatch.Service
