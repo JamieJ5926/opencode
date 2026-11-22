@@ -4,9 +4,10 @@ import type { FileState } from "./types"
 
 // One normalized path's content lifecycle in the provider's directory. An unloaded or evicted file has no entry.
 // `rerun` records a change reported while a read was in flight: that read's result is outdated, so one more read runs
-// when it settles. `stale` records a failed refresh, so the next plain load reads again. A read has no deadline of its
-// own: the transport gives up on a server that sends no response, which arrives here as `load.failed`, and a large file
-// may download for as long as it needs.
+// when it settles. `stale` records content that is no longer known fresh — a failed refresh, or a closed tab whose
+// watch stopped — so the next plain load reads again. A read has no deadline of its own: the transport gives up on a
+// server that sends no response, which arrives here as `load.failed`, and a large file may download for as long as it
+// needs.
 export type FileEntryState =
   | { readonly status: "loading"; readonly attempt: number; readonly silent: boolean; readonly rerun: boolean }
   | { readonly status: "ready"; readonly content: FileContent; readonly stale: boolean }
@@ -45,6 +46,7 @@ export type FileContentEvent =
     }
   | { readonly type: "load.failed"; readonly path: string; readonly attempt: number; readonly error: string }
   | { readonly type: "cache.evicted"; readonly paths: readonly string[] }
+  | { readonly type: "file.closed"; readonly paths: readonly string[] }
   | { readonly type: "scope.changed"; readonly directory: string }
   | { readonly type: "disposed" }
 
@@ -86,6 +88,8 @@ export function transitionFileContent(state: FileContentState, event: FileConten
   }
 
   if (event.type === "cache.evicted") return evict(state, event.paths)
+
+  if (event.type === "file.closed") return stale(state, event.paths)
 
   if (event.type === "load.requested") return request(state, event)
 
@@ -175,6 +179,30 @@ function evict(state: ActiveState, paths: readonly string[]) {
     if (entry.status !== "refreshing") return []
 
     return [[path, { status: "loading", attempt: entry.attempt, silent: entry.silent, rerun: entry.rerun }]]
+  })
+
+  return changed({ ...state, files: Object.fromEntries(files) })
+}
+
+// A closed tab stops its file's watch, so the content shown is no longer known fresh. Keep it on screen — another tab
+// may still be showing it — and let the next plain load read again; a read in flight runs once more when it settles.
+function stale(state: ActiveState, paths: readonly string[]) {
+  const marked = new Set(
+    paths.filter((path) => {
+      const entry = state.files[path]
+
+      if (!entry) return false
+      if (entry.status === "ready") return !entry.stale
+      return entry.status !== "missing" && entry.status !== "error" && !entry.rerun
+    }),
+  )
+
+  if (marked.size === 0) return unchanged(state)
+
+  const files = Object.entries(state.files).map(([path, entry]): [string, FileEntryState] => {
+    if (entry.status === "ready") return [path, marked.has(path) ? { ...entry, stale: true } : entry]
+    if (entry.status === "missing" || entry.status === "error") return [path, entry]
+    return [path, marked.has(path) ? { ...entry, rerun: true } : entry]
   })
 
   return changed({ ...state, files: Object.fromEntries(files) })

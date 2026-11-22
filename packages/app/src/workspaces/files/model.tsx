@@ -341,6 +341,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       const file = path.normalize(input)
 
       if (!file || path.absolute(file)) return
+      // The tab going away stops the file's watch, so what the pane cached is no longer known fresh. Keep it on
+      // screen until the reopen's plain load reads again.
+      dispatch({ type: "file.closed", paths: [file] })
       void serverSDK.api.experimental.file.unwatch({ path: file, location: { directory: scope() } }).catch(() => {})
     }
 

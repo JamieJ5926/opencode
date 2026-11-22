@@ -140,6 +140,45 @@ describe("file content machine", () => {
     expect(transitionFileContent(loaded, requested()).state).toBe(loaded)
   })
 
+  // Closing a tab stops the file's watch, so the bytes it cached are no longer known fresh. The reopen is a plain
+  // load with no force: the close's stale mark, not the caller, makes it read again.
+  test("a closed tab's file rereads on the next plain load", () => {
+    const loaded = replay([requested(), succeeded(1, before)]).state
+    const closed = transitionFileContent(loaded, { type: "file.closed", paths: ["a.ts"] })
+
+    expect(entry(closed.state)).toEqual({ status: "ready", content: before, stale: true })
+
+    const step = transitionFileContent(closed.state, requested())
+
+    expect(step.effects).toEqual([read(2)])
+
+    const reopened = transitionFileContent(step.state, succeeded(2, after))
+
+    expect(entry(reopened.state)).toEqual({ status: "ready", content: after, stale: false })
+  })
+
+  test("a close keeps the content a refresh is reading and reruns it once it settles", () => {
+    const loaded = replay([requested(), succeeded(1, before)]).state
+    const refreshing = transitionFileContent(loaded, requested(true, true)).state
+    const closed = transitionFileContent(refreshing, { type: "file.closed", paths: ["a.ts"] })
+
+    expect(entry(closed.state)).toEqual({
+      status: "refreshing",
+      content: before,
+      attempt: 2,
+      silent: true,
+      rerun: true,
+    })
+
+    const settled = transitionFileContent(closed.state, succeeded(2, before))
+
+    expect(entry(settled.state)).toEqual({ status: "refreshing", content: before, attempt: 3, silent: true, rerun: false })
+    expect(settled.effects).toEqual([
+      { type: "cache.store", path: "a.ts", content: before },
+      read(3),
+    ])
+  })
+
   // Reloading a missing file used to keep `notFound` beside `loading`.
   test("reloading a missing file shows it loading, not missing", () => {
     const gone = replay([requested(), missing(1)]).state
