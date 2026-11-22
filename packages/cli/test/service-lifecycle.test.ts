@@ -134,6 +134,35 @@ serviceTest(
 )
 
 serviceTest(
+  "a live but undiscoverable server fails the relaunch fast instead of spiralling on the bind",
+  async () => {
+    await using home = await serviceHome()
+    await ensure(home)
+    const before = await settled(home)
+
+    // Alive and still holding the port, but undiscoverable: frozen and unregistered.
+    process.kill(before.pid, "SIGSTOP")
+    await fs.rm(home.registration)
+
+    const began = Date.now()
+    const conflict = await cli(home, "service", "start").then(() => undefined, (error: Error) => error.message)
+    // The bind can never succeed against a server that never answers, so no retry spiral.
+    expect(Date.now() - began).toBeLessThan(10_000)
+    expect(conflict).toContain(
+      `Managed service port ${home.port} on 127.0.0.1 is already in use by ${
+        process.platform !== "win32" && Bun.which("lsof") ? `PID ${before.pid}` : "another process"
+      }`,
+    )
+    expect(await Bun.file(home.registration).exists()).toBe(false)
+
+    process.kill(before.pid, "SIGKILL")
+    await exited(before.pid)
+    await stopped(home)
+  },
+  120_000,
+)
+
+serviceTest(
   "a damaged registration and then a crash each end with one replacement server",
   async () => {
     await using home = await serviceHome()

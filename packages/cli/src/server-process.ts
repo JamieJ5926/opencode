@@ -171,6 +171,16 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
         Effect.catch((error) => {
           if (findIncumbent === undefined || !addressInUse(error)) return Effect.fail(error)
           return Effect.gen(function* () {
+            // The registration could not name the incumbent, so ask the port who holds it. An owner that
+            // answers like an opencode server is a managed service that lost its registration; it frees
+            // the port itself, so the bind retry below races that shutdown. A foreign or silent owner
+            // never frees the port: retrying the bind cannot succeed, so fail at once naming the owner.
+            const probe =
+              port === undefined ? undefined : yield* Effect.promise(() => probePortOwner(port, hostname, config.password))
+            if (probe === "foreign" && port !== undefined) {
+              const owner = yield* PortOwner.describe(port, hostname)
+              return yield* Effect.fail(new Error(portInUseMessage(port, hostname, owner), { cause: error }))
+            }
             const deadline = Date.now() + 15_000
             while (Date.now() < deadline) {
               const found = yield* findIncumbent.pipe(Effect.timeoutOption(deadline - Date.now()))
@@ -182,13 +192,7 @@ const processEffect = Effect.fnUntraced(function* (options: Options) {
               if (server !== undefined) return server
             }
             const owner = port === undefined ? undefined : yield* PortOwner.describe(port, hostname)
-            return yield* Effect.fail(
-              new Error(
-                `Managed service port ${port} on ${hostname} is already in use by ${owner ?? "another process"}. ` +
-                  "Configure another port with `opencode service set port <port>` and start the service again.",
-                { cause: error },
-              ),
-            )
+            return yield* Effect.fail(new Error(portInUseMessage(port, hostname, owner), { cause: error }))
           })
         }),
       )
@@ -234,6 +238,61 @@ function addressInUse(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false
   if ("code" in error && error.code === "EADDRINUSE") return true
   return "cause" in error && addressInUse(error.cause)
+}
+
+// Why the bind failed against an owner the registration could not name: an opencode server
+// (it frees the port itself, or becomes discoverable again), a port that was just freed (the
+// bind may still win), or a foreign or silent owner that never will.
+type PortOwnerProbe = "service" | "free" | "foreign"
+
+// Ask the port's owner the way a client would, with the same request timeout the client's own
+// discovery probes use (defaultEnsureTiming.requestTimeout). An answer in one of the shapes
+// packages/server emits for /api/info identifies an opencode service; anything else, or no
+// answer at all, does not.
+async function probePortOwner(port: number, hostname: string, password?: string): Promise<PortOwnerProbe> {
+  const headers =
+    password === undefined
+      ? undefined
+      : { authorization: "Basic " + Buffer.from(`opencode:${password}`).toString("base64") }
+  try {
+    const response = await fetch(new URL("/api/info", serviceURL(hostname, port)), {
+      headers,
+      signal: AbortSignal.timeout(2_000),
+    })
+    return opencodeHealth(await response.json().catch(() => undefined)) ? "service" : "foreign"
+  } catch (cause) {
+    return connectionRefused(cause) ? "free" : "foreign"
+  }
+}
+
+// The JSON shapes packages/server answers /api/info with before the app router runs: the info
+// body, the starting/stopping/failed body, and the unauthorized challenge.
+function opencodeHealth(body: unknown): boolean {
+  if (typeof body !== "object" || body === null) return false
+  const record = body as { readonly pid?: unknown; readonly code?: unknown; readonly _tag?: unknown }
+  if (Number.isInteger(record.pid) && (record.pid as number) >= 0) return true
+  if (
+    record.code === "service_starting" ||
+    record.code === "service_stopping" ||
+    record.code === "service_failed"
+  )
+    return true
+  return record._tag === "UnauthorizedError"
+}
+
+// A refused connection means the owner exited between the failed bind and the probe; the bind
+// may still win, so that race keeps its retry.
+function connectionRefused(cause: unknown): boolean {
+  if (typeof cause !== "object" || cause === null) return false
+  if ("code" in cause && cause.code === "ECONNREFUSED") return true
+  return "cause" in cause && connectionRefused(cause.cause)
+}
+
+function portInUseMessage(port: number | undefined, hostname: string, owner: string | undefined) {
+  return (
+    `Managed service port ${port} on ${hostname} is already in use by ${owner ?? "another process"}. ` +
+    "Configure another port with `opencode service set port <port>` and start the service again."
+  )
 }
 
 function waitForStdinClose() {
