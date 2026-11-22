@@ -8,6 +8,9 @@ const CHILD = path.join(import.meta.dir, "fixture/mcp-process-guard/server-child
 const WRAPPER = path.join(import.meta.dir, "fixture/mcp-process-guard/wrapper.mjs")
 const STUB = path.join(import.meta.dir, "fixture/mcp-process-guard/stub-server.mjs")
 
+// The guard and the SIGUSR2 close signal are POSIX-only; the Windows unit leg runs this suite.
+const testPosix = process.platform === "win32" ? test.skip : test
+
 const alive = (pid: number) => {
   try {
     process.kill(pid, 0)
@@ -58,7 +61,8 @@ async function startServer() {
   const parsed = JSON.parse(readFileSync(pidsFile, "utf8")) as { wrapper: number }
   const pids: Pids = { wrapper: parsed.wrapper, stub: Number(readFileSync(stubPidFile, "utf8")) }
   const cleanup = () => {
-    for (const pid of [pids.wrapper, pids.stub]) {
+    for (const pid of [child.pid, pids.wrapper, pids.stub]) {
+      if (pid === undefined) continue
       try {
         process.kill(-pid, "SIGKILL")
       } catch {}
@@ -71,7 +75,7 @@ async function startServer() {
   return { child, exited, pids, cleanup }
 }
 
-test("a SIGKILLed server leaves no wrapper or server behind", async () => {
+testPosix("a SIGKILLed server leaves no wrapper or server behind", async () => {
   const { child, exited, pids, cleanup } = await startServer()
   try {
     expect(alive(pids.wrapper)).toBe(true)
@@ -89,7 +93,7 @@ test("a SIGKILLed server leaves no wrapper or server behind", async () => {
   }
 }, 30_000)
 
-test("a graceful close still stops the wrapper and its server", async () => {
+testPosix("a graceful close still stops the wrapper and its server", async () => {
   const { child, exited, pids, cleanup } = await startServer()
   try {
     process.kill(child.pid!, "SIGUSR2")

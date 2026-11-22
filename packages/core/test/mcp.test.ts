@@ -868,7 +868,9 @@ test("spawns local MCP servers through the location environment", async () => {
   expect(spawns).toHaveLength(1)
   const command = spawns[0]
   if (!command || !ChildProcess.isStandardCommand(command)) throw new Error("Expected a standard process command")
-  expect(command.command).toBe(process.execPath)
+  // Local servers run under the crash guard, so the configured command is the guard's argument.
+  expect(command.command).toBe("/bin/sh")
+  expect(command.args?.[2]).toBe(process.execPath)
   expect(command.options.cwd).toBe(cwd)
   expect(command.options.extendEnv).toBe(true)
   expect(command.options.env).toEqual({ MCP_LOCATION_TEST: "configured" })
@@ -3542,10 +3544,11 @@ describe("MCP pool", () => {
       const a = yield* open(config, pool, directories[0], { environment: recordingEnvironmentLayer(spawns) })
       expect((yield* status(a.mcp))?.status).toBe("failed")
       expect(probes).toHaveLength(1)
-      // On Windows the spawn succeeds through the shell and the missing command shows up only as an exit
-      // during the handshake, which can't be told apart from a server refusing it, so it connects on its own.
-      // That exit also looks like a legacy server quitting on the version probe, so it respawns once for initialize.
-      expect(spawns).toHaveLength(process.platform === "win32" ? 2 : 0)
+      // Where the command runs through a shell (Windows always, POSIX under the crash guard) the spawn
+      // succeeds and the missing command shows up only as an exit during the handshake, which can't be
+      // told apart from a server refusing it, so it connects on its own. That exit also looks like a
+      // legacy server quitting on the version probe, so it respawns once for initialize.
+      expect(spawns).toHaveLength(2)
     }),
   )
 

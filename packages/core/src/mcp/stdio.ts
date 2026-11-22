@@ -5,7 +5,6 @@ import { Cause, Duration, Effect, Fiber, Option, Queue, Result, Scope, Stream } 
 import { ChildProcess } from "effect/process"
 import type { ChildProcessHandle } from "effect/process/ChildProcessSpawner"
 import { Environment } from "../environment/index.js"
-import { Location } from "../location.js"
 import { FileAccess } from "../file-access.js"
 
 /** Mirrors StdioClientTransport: wait this long for a graceful exit after stdin closes. */
@@ -68,9 +67,9 @@ export const resolveCwd = (directory: string, cwd: string | undefined) =>
  */
 export const make = Effect.fnUntraced(function* (options: Options) {
   const environment = yield* Environment.Service
-  // Only a server spawned on this POSIX host is a child of this process; workspaces run their own.
-  const location = yield* Effect.serviceOption(Location.Service)
-  const guarded = process.platform !== "win32" && Option.isSome(location) && !location.value.workspaceID
+  // Only a local host environment's spawner runs the server as a child of this process; a workspace
+  // environment spawns on its own host, where this fd-3 pipe has no parent end.
+  const guarded = process.platform !== "win32" && environment.id === Environment.localID
   const [command, ...args] = guarded
     ? ["/bin/sh", "-c", GUARD, options.command, options.command, ...options.args]
     : [options.command, ...options.args]
